@@ -1850,6 +1850,74 @@ class TestGeminiEndpointNonStreaming:
         assert json.loads(post2.call_args.args[2])["model"] == "gpt-4o"
 
 
+class TestDeepSeekProvider:
+    """DeepSeek is served by the OpenAI-compatible transport and differs only
+    by its default endpoint (https://api.deepseek.com) and model ids."""
+
+    def test_default_base_url_per_provider(self):
+        client = _make_client()
+        assert client._default_base_url() == "https://api.openai.com"
+        client._settings.llm_provider = "deepseek"
+        assert client._default_base_url() == "https://api.deepseek.com"
+        client._settings.llm_base_url = "https://gateway.example/deepseek"
+        assert client._default_base_url() == "https://gateway.example/deepseek"
+
+    def test_call_openai_posts_to_deepseek_endpoint(self):
+        client = _make_client()
+        client._settings.llm_provider = "deepseek"
+        client._settings.llm_model = "deepseek-chat"
+        response = json.dumps(
+            {"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}]}
+        )
+
+        with patch(
+            "kicad_plugin.llm_client._https_post_json", return_value=(200, response)
+        ) as post:
+            client._call_openai("sys", [])
+
+        assert post.call_args.args[0] == "https://api.deepseek.com/v1/chat/completions"
+        assert post.call_args.args[1]["Authorization"] == "Bearer sk-test"
+        assert json.loads(post.call_args.args[2])["model"] == "deepseek-chat"
+
+    def test_custom_base_url_overrides_deepseek_default(self):
+        client = _make_client()
+        client._settings.llm_provider = "deepseek"
+        client._settings.llm_base_url = "https://gateway.example/deepseek"
+        response = json.dumps(
+            {"choices": [{"finish_reason": "stop", "message": {"content": "ok"}}]}
+        )
+
+        with patch(
+            "kicad_plugin.llm_client._https_post_json", return_value=(200, response)
+        ) as post:
+            client._call_openai("sys", [])
+
+        assert post.call_args.args[0] == "https://gateway.example/deepseek/v1/chat/completions"
+
+    def test_reasoning_route_streams_to_deepseek_endpoint(self):
+        client = _make_client()
+        client._settings.llm_provider = "deepseek"
+        client._settings.llm_model = "deepseek-reasoner"
+        sse_lines = [
+            'data: {"choices":[{"delta":{"reasoning_content":"think"},"finish_reason":null}]}',
+            'data: {"choices":[{"delta":{"content":"answer"},"finish_reason":"stop"}]}',
+            "data: [DONE]",
+        ]
+        mock_resp = MagicMock()
+        mock_resp.readline.side_effect = [line.encode("utf-8") + b"\n" for line in sse_lines] + [
+            b""
+        ]
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+
+        with patch("urllib.request.urlopen", return_value=mock_resp) as m:
+            result = client._stream_openai("sys", [], on_stream_event=lambda evt: None)
+
+        assert m.call_args[0][0].full_url == ("https://api.deepseek.com/v1/chat/completions")
+        assert result["message"]["content"] == "answer"
+        assert result["message"]["reasoning_content"] == "think"
+
+
 class TestHttpsFallback:
     def test_certificate_error_retries_with_plugin_ca_bundle(self):
         certificate_error = ssl.SSLCertVerificationError(

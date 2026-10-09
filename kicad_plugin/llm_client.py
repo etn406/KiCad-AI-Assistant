@@ -263,6 +263,18 @@ _COMPACTION_SUMMARY_FLOOR_CHARS = 800
 # pyproject.toml (the plugin package has no __version__).
 _LLM_USER_AGENT = "KiCad-AI-Assistant/0.2.5 (+https://github.com/paul356/KiCad-AI-Assistant)"
 
+# Default API base URL per provider, used when llm_base_url is empty. DeepSeek
+# exposes an OpenAI-compatible API (Bearer auth, /chat/completions), so it
+# shares the OpenAI transport and differs only by this endpoint and its model
+# ids (deepseek-chat / deepseek-reasoner). Unknown providers fall back to the
+# OpenAI endpoint.
+_PROVIDER_DEFAULT_BASE_URL: dict[str, str] = {
+    "openai": "https://api.openai.com",
+    "deepseek": "https://api.deepseek.com",
+    "anthropic": "https://api.anthropic.com",
+    "ollama": "http://localhost:11434",
+}
+
 # ------------------------------------------------------------------
 # On-demand tool loading (issue #129)
 # ------------------------------------------------------------------
@@ -1170,6 +1182,7 @@ class LLMClient:
 
     Supports:
       - provider="openai"    → OpenAI chat completions API (and compatible endpoints)
+      - provider="deepseek"  → DeepSeek OpenAI-compatible API (deepseek-chat / deepseek-reasoner)
       - provider="anthropic" → Anthropic messages API
       - provider="ollama"    → Ollama native API
       - provider="bedrock"   → Amazon Bedrock OpenAI-compatible endpoint
@@ -2945,7 +2958,7 @@ class LLMClient:
         non-streaming fallback here; _call_openai is used only by callers
         that do not provide on_stream_event (e.g. history compaction).
         """
-        base = self._settings.llm_base_url or "https://api.openai.com"
+        base = self._default_base_url()
         url = self._openai_endpoint_url(base)
 
         messages = [{"role": "system", "content": system}] + self._history
@@ -3104,7 +3117,7 @@ class LLMClient:
         Ollama returns newline-delimited JSON (NDJSON), not SSE.
         Since Ollama runs on localhost, no SSL fallback is needed.
         """
-        base = (self._settings.llm_base_url or "http://localhost:11434").rstrip("/")
+        base = self._default_base_url("ollama").rstrip("/")
         url = f"{base}/api/chat"
 
         messages = [{"role": "system", "content": system}] + self._ollama_messages()
@@ -3200,7 +3213,7 @@ class LLMClient:
         import urllib.error
         import urllib.request
 
-        base = (self._settings.llm_base_url or "https://api.anthropic.com").rstrip("/")
+        base = self._default_base_url("anthropic").rstrip("/")
         # Accept full endpoint URL or bare hostname — only append the default
         # path when the user hasn't already specified one.
         if "/v1/messages" in base:
@@ -3374,6 +3387,18 @@ class LLMClient:
         base = (self._settings.llm_base_url or "").rstrip("/")
         return "generativelanguage.googleapis.com" in base
 
+    def _default_base_url(self, provider: str | None = None) -> str:
+        """Return the API base URL for the active provider.
+
+        An explicit ``llm_base_url`` always wins; otherwise the provider's
+        documented default endpoint is returned (``_PROVIDER_DEFAULT_BASE_URL``),
+        falling back to the OpenAI endpoint for unknown providers.
+        """
+        if self._settings.llm_base_url:
+            return self._settings.llm_base_url
+        provider = provider or self._settings.llm_provider
+        return _PROVIDER_DEFAULT_BASE_URL.get(provider, _PROVIDER_DEFAULT_BASE_URL["openai"])
+
     def _openai_headers(self) -> dict[str, str]:
         """Build headers for OpenAI-compatible endpoints with optional auth."""
         headers = {"Content-Type": "application/json", "User-Agent": self._user_agent()}
@@ -3444,7 +3469,7 @@ class LLMClient:
         }
 
     def _call_openai(self, system: str, tools: list[dict]) -> dict[str, Any]:
-        base = self._settings.llm_base_url or "https://api.openai.com"
+        base = self._default_base_url()
         url = self._openai_endpoint_url(base)
         payload = self._openai_payload(system, tools, stream=False)
         headers = self._openai_headers()
@@ -3538,7 +3563,7 @@ class LLMClient:
         Uses the Ollama /api/chat endpoint.  No API key is required.
         Tool format is the same as OpenAI-compatible (Ollama supports it natively).
         """
-        base = (self._settings.llm_base_url or "http://localhost:11434").rstrip("/")
+        base = self._default_base_url("ollama").rstrip("/")
         url = f"{base}/api/chat"
 
         messages = [{"role": "system", "content": system}] + self._ollama_messages()
@@ -3644,7 +3669,7 @@ class LLMClient:
         }
 
     def _call_anthropic(self, system: str, tools: list[dict]) -> dict[str, Any]:
-        base = (self._settings.llm_base_url or "https://api.anthropic.com").rstrip("/")
+        base = self._default_base_url("anthropic").rstrip("/")
         # Accept full endpoint URL or bare hostname — only append the default
         # path when the user hasn't already specified one.
         if "/v1/messages" in base:

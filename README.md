@@ -45,7 +45,7 @@ Tested on **KiCad 10.0 / Linux & Windows**.
 - KiCad 10.0 or higher
 - [`uv`](https://github.com/astral-sh/uv) — manages the Python virtual environment and installs the correct Python version automatically
   - `curl -Lsf https://astral.sh/uv/install.sh | sh`
-- An API key for OpenAI, Anthropic, Amazon Bedrock, or a compatible LLM provider (Ollama needs none)
+- An API key for OpenAI, Anthropic, DeepSeek, Amazon Bedrock, or a compatible LLM provider (Ollama needs none)
 
 ## Installation
 
@@ -148,7 +148,7 @@ All settings can be changed through **Options → Settings** in the plugin panel
 
 | Setting | Description | Default |
 |---------|-------------|---------|
-| `llm_provider` | LLM provider: `openai`, `anthropic`, `ollama`, or `bedrock` | `openai` |
+| `llm_provider` | LLM provider: `openai`, `anthropic`, `ollama`, `bedrock`, or `deepseek` | `openai` |
 | `llm_api_key` | Your LLM API key (stored with owner-only permissions). For `bedrock`, a Bedrock API key used as a bearer token | *(empty)* |
 | `llm_model` | Model name. For `bedrock`, a Bedrock model or inference-profile id — newer Claude models need the cross-region profile form, e.g. `us.anthropic.claude-opus-5-5` (swap `us.` for your region) | `gpt-4o` |
 | `llm_base_url` | Custom endpoint URL (overrides the provider default) | *(provider default)* |
@@ -169,6 +169,17 @@ Bedrock requests go to the native Bedrock Runtime `InvokeModel` API (not the Ope
 - **AWS SigV4** — set `llm_aws_access_key_id` + `llm_aws_secret_access_key` (and optionally `llm_aws_session_token`); requests are signed with SigV4 for the configured `llm_aws_region`.
 
 Use a model id enabled in your account/region — the cross-region inference-profile ids work well, e.g. `us.anthropic.claude-opus-5-5` or a versioned id like `us.anthropic.claude-sonnet-4-5-20250929-v1:0`. List yours with `aws bedrock list-inference-profiles --region <region>`. Responses are streamed to the chat panel in a single block, since Bedrock's streaming uses a binary framing the plugin's transport does not decode.
+
+### DeepSeek
+
+DeepSeek is served through the OpenAI-compatible transport, so it needs no special setup beyond selecting the provider and entering your API key:
+
+- **Provider**: `deepseek` (default model: `deepseek-chat`).
+- **Endpoint**: `https://api.deepseek.com` (a custom `llm_base_url` still overrides it).
+- **Models**: `deepseek-chat` is recommended for the tool-calling loop; `deepseek-reasoner` works too and its `reasoning_content` is preserved in the conversation.
+- **Vision**: DeepSeek models are text-only — leave "Model supports vision" unchecked.
+
+No vision support means image-bearing tool results (e.g. `export_pcb_layer_image`) are not relayed to DeepSeek.
 
 ## Standalone MCP Server
 

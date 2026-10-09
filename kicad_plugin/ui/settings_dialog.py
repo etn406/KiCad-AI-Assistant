@@ -21,7 +21,7 @@ if _WX_AVAILABLE:
     class SettingsDialog(wx.Dialog):
         """Simple dialog for editing plugin settings."""
 
-        _PROVIDERS = ["openai", "anthropic", "ollama", "bedrock"]
+        _PROVIDERS = ["openai", "anthropic", "ollama", "bedrock", "deepseek"]
         # Suggested default model per provider. Used only to pre-fill the Model
         # field when switching providers if it is empty or still holds another
         # provider's default — a custom entry is never overwritten. The Bedrock
@@ -35,6 +35,7 @@ if _WX_AVAILABLE:
             "anthropic": "claude-opus-5-5",
             "ollama": "llama3.1",
             "bedrock": "us.anthropic.claude-opus-5-5",
+            "deepseek": "deepseek-chat",
         }
         # User-Agents proven accepted (HTTP 200) at opencode.ai's edge in
         # issue #149; urllib's default (Python-urllib/...) is rejected (403).

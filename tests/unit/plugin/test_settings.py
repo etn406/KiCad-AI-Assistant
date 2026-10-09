@@ -71,6 +71,19 @@ class TestPluginSettingsSaveLoad:
         assert loaded.server_port == 8765
         assert loaded.show_tool_log is False
 
+    def test_round_trip_deepseek_provider(self, tmp_config_dir):
+        s = PluginSettings(
+            config_dir=tmp_config_dir,
+            llm_provider="deepseek",
+            llm_api_key="sk-deepseek",
+            llm_model="deepseek-chat",
+        )
+        s.save()
+
+        loaded = PluginSettings.load(config_dir=tmp_config_dir)
+        assert loaded.llm_provider == "deepseek"
+        assert loaded.llm_model == "deepseek-chat"
+
     def test_load_missing_file_returns_defaults(self, tmp_config_dir):
         loaded = PluginSettings.load(config_dir=tmp_config_dir)
         assert loaded.llm_provider == "openai"

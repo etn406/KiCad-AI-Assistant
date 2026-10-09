@@ -7,7 +7,8 @@ It owns the LLM client lifecycle, collects live project context via KiCad's scri
 spawns the MCP server subprocess. All user interaction flows through it.
 
 **LLM Client** runs embedded in the plugin process and speaks to an external LLM API (OpenAI,
-Anthropic, or a compatible endpoint). It drives the agentic loop: it sends tool definitions along
+Anthropic, Ollama, Amazon Bedrock, DeepSeek, or a compatible endpoint). It drives the agentic loop:
+it sends tool definitions along
 with conversation history, receives tool-call requests, forwards them to the MCP server, and feeds
 results back until the model produces a final natural-language reply.
 

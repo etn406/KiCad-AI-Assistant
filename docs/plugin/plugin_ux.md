@@ -116,7 +116,7 @@ A per-tool approve/reject mode can be added in a later milestone. In that mode, 
 ## 7. Settings Panel
 
 Accessed via the ⚙ icon. Exposes:
-- LLM provider selector (OpenAI / Anthropic / Custom endpoint)
+- LLM provider selector (OpenAI / Anthropic / Ollama / Bedrock / DeepSeek / Custom endpoint)
 - API key input (stored securely in KiCad plugin settings)
 - Model selector
 - Show/hide tool log by default

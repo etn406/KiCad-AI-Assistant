@@ -85,7 +85,7 @@ class PluginSettings:
     """All user-configurable settings for the KiCad AI Assistant plugin."""
 
     # LLM provider
-    llm_provider: str = "openai"  # "openai" | "anthropic" | "ollama" | "bedrock"
+    llm_provider: str = "openai"  # "openai" | "anthropic" | "ollama" | "bedrock" | "deepseek"
     llm_api_key: str = field(default="", repr=False)  # never leak key in logs/repr
     llm_user_agent: str = DEFAULT_LLM_USER_AGENT  # UA for OpenAI/Anthropic requests
     llm_model: str = "gpt-4o"  # model name

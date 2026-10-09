@@ -46,7 +46,7 @@ KiCad AI Assistant 是一个 KiCad 动作插件，在 KiCad 内部直接嵌入�
 - KiCad 10.0 或更高版本
 - [`uv`](https://github.com/astral-sh/uv) — 管理 Python 虚拟环境并自动安装所需 Python 版本
   - `curl -Lsf https://astral.sh/uv/install.sh | sh`
-- OpenAI、Anthropic 或兼容 LLM 提供商的 API Key
+- OpenAI、Anthropic、DeepSeek 或兼容 LLM 提供商的 API Key（Ollama 无需 API Key）
 
 ## 安装
 
