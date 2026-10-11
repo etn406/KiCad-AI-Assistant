@@ -23,7 +23,7 @@ import subprocess  # nosec B404 -- controlled subprocess execution, no user inpu
 import time
 from typing import Any
 
-from .tool_registry import get_missing_tool_policies, get_tool_policy
+from .tool_registry import TOOL_POLICIES, get_missing_tool_policies, get_tool_policy
 
 log = logging.getLogger(__name__)
 
@@ -208,13 +208,37 @@ def _load_skill_catalog_entries() -> list[dict[str, str]]:
     return sorted(skills, key=lambda s: (-int(s["priority"]), s["name"]))
 
 
+# Static category → skill fast-path for the prompt-level catalog. Hardcoded
+# (not derived from the skill directory) so the system prompt stays
+# size-stable regardless of skill authoring; list_skills() remains the
+# authoritative, always-current catalog for everything else.
+_SKILL_CATEGORY_GUIDE = (
+    "Skills are organized by task category — `list_skills()` lists the how-to "
+    "guides for MCP tools and `get_skill(name)` loads the one matching your "
+    "task: routing→pcb-routing, placement→pcb-placement/schematic-placement, "
+    "DRC→drc-rules, wiring→schematic-wiring, symbol→symbol-edit/symbol-library, "
+    "geometry→pcb-outline/pcb-zone, footprint→pcb-footprint-library, "
+    "query→pcb-query, sheet→sheet-management."
+)
+
+
 def _build_skill_catalog_block() -> str:
-    """Render a compact catalog of available on-demand workflow skills."""
+    """Render the category guide plus the full ``- name: description`` list.
+
+    Every line comes from the skill front-matter via ``_load_skill_catalog_entries()``
+    (name falls back to the stem, description omitted when absent), so the block
+    never drifts from the authored skills.
+    """
     skills = _load_skill_catalog_entries()
     if not skills:
         return ""
-    names = ", ".join(skill["name"] for skill in skills)
-    return "# Skills\n" + names
+    lines = [
+        f"- {skill['name']}: {skill['description']}"
+        if skill["description"]
+        else f"- {skill['name']}"
+        for skill in skills
+    ]
+    return "# Skills\n" + _SKILL_CATEGORY_GUIDE + "\n" + "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -281,18 +305,22 @@ _META_TOOL_NAMES = frozenset({"enable_tool", "disable_tool", "get_tool_schema"})
 
 _TOOL_LOADING_PROMPT = (
     "\n\n## Tool loading protocol\n"
-    "- Only enabled tools are callable; their schemas are included in every request.\n"
-    "- Call `enable_tool(tools=[...])` to activate a batch — schemas appear in the "
-    "next request, in catalog order.\n"
-    "- Plan ahead: enable every tool the task may need in ONE batch up front. Avoid "
-    "per-step toggling — each enable/disable rewrites the tools segment and loses "
-    "the provider cache on it.\n"
-    "- Keep tools enabled for the whole task; call `disable_tool` only once a tool is "
-    "clearly no longer needed.\n"
-    "- `get_tool_schema(name)` previews the schema of a tool that is NOT enabled "
-    "(enabled schemas are already in context).\n"
-    "- Calls to tools that are not enabled are rejected — enable them first.\n"
-    "- Do one enable round per task, then execute."
+    "- All catalog tools are callable immediately — `enable_tool` is optional "
+    "and only pins a tool's schema into every request for repeated use.\n"
+    "- `enable_tool(tools=[...])` activates a batch; schemas appear in the next "
+    "request, in catalog order. `disable_tool` drops them when done.\n"
+    "- Prefer `get_tool_schema(tools=[...])` for parameter lookups — it previews "
+    "schemas WITHOUT enabling and never touches the tools segment or provider "
+    "cache; call `enable_tool` only for tools you will use repeatedly.\n"
+    "- Tool calls are rejected only for unknown names (not in the catalog) or "
+    "tools with no execution policy — otherwise they run directly.\n"
+    "- Workflow skills: `list_skills()` lists how-to guides for using MCP tools; "
+    "`get_skill(name)` loads the one matching your task's category (routing, "
+    "placement, DRC, …). Load it BEFORE executing task tools — the guides carry "
+    "the correct workflows and pitfalls (waypoints/vias, spacing, pin choice) "
+    "that bare `get_tool_schema` parameter schemas cannot convey.\n"
+    "- Avoid per-step enable/disable toggling — each one rewrites the tools "
+    "segment and loses the provider cache on it; do one enable round per task."
 )
 
 _META_TOOL_DEFS: list[dict[str, Any]] = [
@@ -344,18 +372,25 @@ _META_TOOL_DEFS: list[dict[str, Any]] = [
         "function": {
             "name": "get_tool_schema",
             "description": (
-                "Preview the full schema of one tool that is currently NOT enabled. Enabled "
-                "tools already have their schema in context and are rejected here."
+                "Preview parameter schemas of one or more tools — all catalog tools are "
+                "callable regardless; use this mainly for tools that are NOT enabled "
+                "(their schema is absent from your request) so you call them with "
+                "correct arguments. Pass a `tools` batch (or legacy `tool_name`); "
+                "enabled tools are skipped (schema already in context)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "tools": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Exact tool names from the catalog to preview as a batch.",
+                    },
                     "tool_name": {
                         "type": "string",
-                        "description": "Exact tool name from the catalog.",
-                    }
+                        "description": "Exact single tool name (legacy; prefer `tools`).",
+                    },
                 },
-                "required": ["tool_name"],
             },
         },
     },
@@ -973,8 +1008,7 @@ You are a KiCad assistant — modest, cautious, and proactive.
 - Edit schematics/PCBs via MCP tools.
 - Unless asked, never call `save_project_version`, `reload_kicad`,
   `check_kicad_ipc_connection`, or `save_document`.
-- The framework handles snapshots/reloads. Use ``list_skills()`` /
-  ``get_skill(name)`` for guides.\
+- The framework handles snapshots/reloads.\
 """
 
 _PROMPT_SCHEMATIC = """\
@@ -989,19 +1023,17 @@ _PROMPT_SCHEMATIC = """\
   0°=unrotated, 90°=tilt left, 180°=flipped, 270°=tilt right.
 - The schematic grid is **1.27 mm (50 mil)**. add_symbol_to_schematic and
   move_component snap automatically; rotation is restricted to 0/90/180/270.
-- Default sheet is **A4 (297 x 210 mm)**. At the start of each request
-  that involves spatial changes, call get_schematic_sheet_info once to
-  confirm the actual paper size and to learn the recommended drawing area
-  (it accounts for the title block).
+- Default sheet is **A4 (297 x 210 mm)**. For spatial changes, call
+  get_schematic_sheet_info once to confirm the actual paper size and the
+  recommended drawing area (title-block aware).
 
 # Hard rules (schematic)
 - Always call extract_schematic_netlist (or get_schematic_sheet_info) for
   state before making spatial changes. Never invent coordinates.
 - Use the active_schematic path from the context block below as the
   schematic_path argument for every editing tool.
-- Every mutation tool automatically writes a .kicad_sch.bak backup and saves
-  to disk. The plugin framework handles the version snapshot and final
-  `reload_kicad(...)` call automatically for successful file mutations.
+- Mutations auto-write a .kicad_sch.bak backup; the framework handles the
+  version snapshot and final reload automatically.
 - Report errors clearly. Do not silently retry failed tool calls.
 - If find_free_area returns no candidates and no relative placement is
   appropriate, ASK the engineer instead of guessing a position.\
@@ -1027,9 +1059,8 @@ _PROMPT_PCB = """\
   Never invent footprint coordinates.
 - Use the active_pcb path from the context block below as the pcb_path
   argument for every PCB editing tool.
-- Every mutation tool automatically writes a .kicad_pcb.bak backup and saves
-  to disk. The plugin framework handles the version snapshot and final
-  `reload_kicad(...)` call automatically for successful file mutations.
+- Mutations auto-write a .kicad_pcb.bak backup; the framework handles the
+  version snapshot and final reload automatically.
 - Report errors clearly. Do not silently retry failed tool calls.
 - Do not overlap footprint courtyards.  Verify clearances with
   get_footprint_bbox / get_board_bounding_box before committing a move.\
@@ -2434,7 +2465,6 @@ class LLMClient:
             }
 
         if name == "get_tool_schema":
-            tool_name = (args.get("tool_name") or "").strip()
             if self._tool_registry is None:
                 self._fetch_tool_definitions()
             registry = self._tool_registry or {}
@@ -2443,6 +2473,56 @@ class LLMClient:
                     "success": False,
                     "error": "Tool catalog unavailable (MCP server not reachable) — retry next turn.",
                 }
+            tools = args.get("tools")
+            if tools is not None:  # batch preview (primary interface)
+                if not isinstance(tools, list) or not tools:
+                    return {
+                        "success": False,
+                        "error": "Pass a non-empty 'tools' list of exact catalog names.",
+                    }
+                names = [str(t).strip() for t in tools]
+                unknown = [t for t in names if t not in registry]
+                if unknown:  # atomic: one bad name rejects the whole batch
+                    return {
+                        "success": False,
+                        "error": (
+                            "Unknown tool(s): "
+                            + ", ".join(map(repr, unknown))
+                            + " — use exact names from the catalog above."
+                        ),
+                        "suggestions": {
+                            t: difflib.get_close_matches(t, registry.keys(), n=5, cutoff=0.4)
+                            for t in unknown
+                        },
+                    }
+                previews: dict[str, Any] = {}
+                skipped = []
+                for t in names:
+                    if t in self._enabled_tools:
+                        skipped.append(t)
+                        previews[t] = {
+                            "enabled": True,
+                            "note": "Already enabled — schema is in the current context; use it directly.",
+                        }
+                    else:
+                        tdef = registry[t]
+                        previews[t] = {
+                            "enabled": False,
+                            "description": tdef["function"].get("description") or "",
+                            "schema": tdef["function"].get("parameters") or {},
+                        }
+                result: dict[str, Any] = {"success": True, "tools": previews}
+                if skipped:
+                    result["note"] = (
+                        f"{len(skipped)} already-enabled tool(s) skipped — schemas already in context."
+                    )
+                return result
+            if not (args.get("tool_name") or "").strip():
+                return {
+                    "success": False,
+                    "error": "Pass a non-empty 'tools' list (or a single 'tool_name').",
+                }
+            tool_name = (args.get("tool_name") or "").strip()
             if tool_name in registry:
                 if tool_name in self._enabled_tools:
                     return {
@@ -2479,22 +2559,36 @@ class LLMClient:
         state: _ToolExecutionState,
         on_tool_call: Callable[[str, dict, Any], None] | None,
     ) -> dict[str, Any]:
-        """Dispatch one model tool call: meta tools locally, enabled tools via policy.
+        """Dispatch one model tool call: meta tools locally, real tools via policy.
 
-        Calls to real tools that were never enabled are rejected with a clear
-        instruction instead of executing with guessed arguments — crucial for
-        mutation tools.
+        Enable is not a call gate (PR #173 review): every catalog tool executes
+        through the framework policy path even when never enabled — enabling
+        only pins the schema into every request (cache/perf optimization).
+        Names outside the catalog and tools without an execution policy are
+        still refused, guarding against hallucinated names and unhandled
+        mutation semantics.
         """
         if name in _META_TOOL_NAMES:
             result = self._execute_meta_tool(name, args)
             self._emit_tool_callback(on_tool_call, name, args, result)
             return result
-        if name not in self._enabled_tools:
+        registry = self._tool_registry or {}
+        if registry and name not in registry:
             result = {
                 "success": False,
                 "error": (
-                    f"Tool {name!r} is not enabled — call enable_tool(tools=[{name!r}]) "
-                    "first; its schema will be included in the next request."
+                    f"Unknown tool {name!r} — it is not in the catalog; use exact "
+                    "names from the catalog above."
+                ),
+            }
+            self._emit_tool_callback(on_tool_call, name, args, result)
+            return result
+        if name not in TOOL_POLICIES:
+            result = {
+                "success": False,
+                "error": (
+                    f"Tool {name!r} has no execution policy (server/client mismatch) — "
+                    "refusing to execute it."
                 ),
             }
             self._emit_tool_callback(on_tool_call, name, args, result)

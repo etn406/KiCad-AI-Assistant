@@ -3388,13 +3388,112 @@ class TestToolLoading:
         assert result["success"] is False
         assert "extract_schematic_netlist" in result["suggestions"]
 
-    def test_unenabled_real_tool_rejected_without_network(self):
+    def test_get_tool_schema_batch_previews_multiple(self):
         client = _make_client()
-        client._tool_registry = {"extract_netlist": _fake_tool_def("extract_netlist")}
+        client._tool_registry = {
+            "extract_schematic_netlist": _fake_tool_def("extract_schematic_netlist"),
+            "get_board_info": _fake_tool_def("get_board_info"),
+        }
+        preview = client._execute_meta_tool(
+            "get_tool_schema", {"tools": ["extract_schematic_netlist", "get_board_info"]}
+        )
+        assert preview["success"] is True
+        assert set(preview["tools"]) == {"extract_schematic_netlist", "get_board_info"}
+        for entry in preview["tools"].values():
+            assert entry["enabled"] is False
+            assert "schema" in entry and "description" in entry
+        assert client._enabled_tools == set()  # preview never enables
+
+    def test_get_tool_schema_batch_skips_already_enabled(self):
+        client = _make_client()
+        client._tool_registry = {
+            "get_board_info": _fake_tool_def("get_board_info"),
+            "add_zone": _fake_tool_def("add_zone", description="add a zone"),
+        }
+        client._enabled_tools = {"add_zone"}
+        preview = client._execute_meta_tool(
+            "get_tool_schema", {"tools": ["get_board_info", "add_zone"]}
+        )
+        assert preview["success"] is True
+        assert preview["tools"]["get_board_info"]["enabled"] is False
+        assert preview["tools"]["add_zone"]["enabled"] is True
+        assert "already enabled" in preview["tools"]["add_zone"]["note"].lower()
+        assert "skipped" in preview["note"]
+
+    def test_get_tool_schema_batch_unknown_atomically_rejected(self):
+        client = _make_client()
+        client._tool_registry = {
+            "get_board_info": _fake_tool_def("get_board_info"),
+            "extract_schematic_netlist": _fake_tool_def("extract_schematic_netlist"),
+        }
+        result = client._execute_meta_tool(
+            "get_tool_schema", {"tools": ["get_board_info", "extract_schematic_nettlist"]}
+        )
+        assert result["success"] is False  # atomic: no partial preview
+        assert result["suggestions"]["extract_schematic_nettlist"] == ["extract_schematic_netlist"]
+
+    def test_get_tool_schema_batch_rejects_bad_args(self):
+        client = _make_client()
+        client._tool_registry = {"get_board_info": _fake_tool_def("get_board_info")}
+        empty = client._execute_meta_tool("get_tool_schema", {"tools": []})
+        assert empty["success"] is False
+        assert "non-empty" in empty["error"]
+        neither = client._execute_meta_tool("get_tool_schema", {})
+        assert neither["success"] is False
+        assert "tool_name" in neither["error"]
+
+    def test_get_tool_schema_def_describes_batch_preview(self):
+        defs = {d["function"]["name"]: d["function"] for d in llm_client._META_TOOL_DEFS}
+        gts = defs["get_tool_schema"]
+        assert "tools" in gts["parameters"]["properties"]
+        assert "NOT enabled" in gts["description"]
+        assert "tools" in gts["description"]
+
+    def test_unenabled_catalog_tool_executes_via_policy(self):
+        """PR #173 review: enable is not a call gate — unenabled tools run."""
+        client = _make_client()
+        client._tool_registry = {"get_board_info": _fake_tool_def("get_board_info")}
         state = llm_client._ToolExecutionState()
-        result = client._execute_or_reject_tool("extract_netlist", {}, state, None)
+        with patch(
+            "kicad_plugin.llm_client.call_mcp_tool",
+            return_value={"success": True, "info": "board data"},
+        ) as mock_call:
+            result = client._execute_or_reject_tool("get_board_info", {}, state, None)
+        assert result["success"] is True
+        assert mock_call.call_args.args[1] == "get_board_info"
+        assert client._enabled_tools == set()  # ran without ever being enabled
+
+    def test_enabled_tool_still_executes(self):
+        """Enabling stays supported and keeps the same execution path."""
+        client = _make_client()
+        client._tool_registry = {"get_board_info": _fake_tool_def("get_board_info")}
+        client._enabled_tools = {"get_board_info"}
+        state = llm_client._ToolExecutionState()
+        with patch(
+            "kicad_plugin.llm_client.call_mcp_tool",
+            return_value={"success": True, "info": "board data"},
+        ) as mock_call:
+            result = client._execute_or_reject_tool("get_board_info", {}, state, None)
+        assert result["success"] is True
+        assert mock_call.call_args.args[1] == "get_board_info"
+
+    def test_catalogued_tool_without_policy_rejected(self):
+        """Safety: a catalogued tool with no execution policy must not run."""
+        client = _make_client()
+        client._tool_registry = {"mystery_tool": _fake_tool_def("mystery_tool")}
+        state = llm_client._ToolExecutionState()
+        result = client._execute_or_reject_tool("mystery_tool", {}, state, None)
         assert result["success"] is False
-        assert "not enabled" in result["error"]
+        assert "no execution policy" in result["error"]
+
+    def test_unknown_tool_rejected(self):
+        """Hallucinated tool names outside the catalog are refused."""
+        client = _make_client()
+        client._tool_registry = {"get_board_info": _fake_tool_def("get_board_info")}
+        state = llm_client._ToolExecutionState()
+        result = client._execute_or_reject_tool("ghost_tool", {}, state, None)
+        assert result["success"] is False
+        assert "not in the catalog" in result["error"]
 
     def test_meta_tool_executed_locally(self):
         client = _make_client()
@@ -3462,6 +3561,92 @@ class TestToolLoading:
         result = client._execute_meta_tool("get_tool_schema", {"tool_name": "get_board_info"})
         assert result["success"] is False
         assert "unavailable" in result["error"]
+
+
+# ---------------------------------------------------------------------------
+# System-prompt wiring for on-demand skill discovery (list_skills/get_skill)
+# ---------------------------------------------------------------------------
+
+
+def _write_skill_file(skills_dir, name, description, priority="50"):
+    """Write a skill markdown file with front matter into *skills_dir*."""
+    (skills_dir / f"{name}.md").write_text(
+        f'---\nname: {name}\npriority: {priority}\ndescription: "{description}"\n---\n'
+        f"# {name}\nBody of {name}.\n",
+        encoding="utf-8",
+    )
+
+
+class TestSkillPrompt:
+    """Prompt must surface the skill category mapping and teach skill tool loading."""
+
+    def test_catalog_block_surfaces_skill_names(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        _write_skill_file(skills_dir, "pcb-routing", "Routing workflow guide", "95")
+        _write_skill_file(skills_dir, "drc-rules", "DRC rules reference", "45")
+        with patch.object(llm_client, "_SKILLS_DIR", skills_dir):
+            block = llm_client._build_skill_catalog_block()
+        assert "# Skills" in block
+        # The per-skill "- name: description" list is part of the prompt again
+        # (2026-10: budget relaxed so the prompt is not over-compressed); the
+        # category guide and the list must surface the skill names together.
+        assert "pcb-routing" in block
+        assert "drc-rules" in block
+        # Regression guard: at least one full "- name: description" line must
+        # render, so the list cannot silently shrink back to the bare mapping.
+        assert "- pcb-routing: Routing workflow guide" in block
+        assert "- drc-rules: DRC rules reference" in block
+
+    def test_catalog_block_points_to_get_skill(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        _write_skill_file(skills_dir, "pcb-routing", "Routing workflow guide")
+        with patch.object(llm_client, "_SKILLS_DIR", skills_dir):
+            block = llm_client._build_skill_catalog_block()
+        assert "list_skills()" in block
+        assert "get_skill(name)" in block
+        # Review: the catalog says list_skills lists how-to guides for MCP tools.
+        assert "how-to guides" in block
+
+    def test_skill_catalog_block_empty_when_no_skills(self, tmp_path):
+        with patch.object(llm_client, "_SKILLS_DIR", tmp_path / "missing"):
+            assert llm_client._build_skill_catalog_block() == ""
+
+    def test_tool_loading_prompt_covers_skill_tools(self):
+        prompt = llm_client._TOOL_LOADING_PROMPT
+        assert "list_skills()" in prompt
+        assert "get_skill(name)" in prompt
+        # Review: enable is optional — all catalog tools are callable as-is.
+        assert "callable immediately" in prompt
+        assert "optional" in prompt
+
+    def test_catalog_block_maps_task_categories(self, tmp_path):
+        skills_dir = tmp_path / "skills"
+        skills_dir.mkdir()
+        _write_skill_file(skills_dir, "pcb-routing", "Routing workflow guide", "95")
+        with patch.object(llm_client, "_SKILLS_DIR", skills_dir):
+            block = llm_client._build_skill_catalog_block()
+        # The block tells the model skills are organized by task category and
+        # gives the category -> skill mapping for the common cases.
+        assert "organized by task category" in block
+        for needle in ("routing→pcb-routing", "placement→pcb-placement", "DRC→drc-rules"):
+            assert needle in block, f"catalog missing category mapping {needle!r}"
+
+    def test_tool_loading_prompt_loads_guide_per_category(self):
+        prompt = llm_client._TOOL_LOADING_PROMPT
+        assert "task's category" in prompt
+        assert "get_skill(name)" in prompt
+        # Review: tell the model WHY skills matter — workflows/pitfalls that
+        # bare parameter schemas cannot convey.
+        assert "pitfalls" in prompt
+        assert "get_tool_schema" in prompt
+
+    def test_tool_loading_prompt_prefers_schema_preview_over_enable(self):
+        prompt = llm_client._TOOL_LOADING_PROMPT
+        assert "get_tool_schema(tools=[" in prompt
+        assert "WITHOUT enabling" in prompt
+        assert "provider cache" in prompt
 
 
 class TestContextBudgetIncludesTools:
