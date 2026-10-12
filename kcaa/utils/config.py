@@ -631,6 +631,66 @@ class ServerConfig:
 
 
 # ---------------------------------------------------------------------------
+# Module-level vision capability
+# ---------------------------------------------------------------------------
+
+
+def model_supports_vision() -> bool:
+    """Whether the MCP server should attach image blocks to tool results.
+
+    The KiCad plugin is the only caller that knows the model: it passes
+    ``KICAD_MCP_SUPPORTS_VISION=1|0`` when spawning the server (see
+    ``server_manager._build_env``).  Absent (standalone MCP clients such
+    as Claude Desktop) defaults to *True* so vision-capable clients keep
+    receiving rendered images; a text-only model must set it to ``0`` to
+    suppress image data at the source instead of paying the render +
+    payload cost client-side stripping.
+    """
+    raw = os.environ.get("KICAD_MCP_SUPPORTS_VISION", "1").strip().lower()
+    return raw not in ("", "0", "false", "no", "off")
+
+
+def render_route_png_enabled() -> bool:
+    """Whether route/evidence PNGs are rendered and returned.
+
+    Independent kill-switch on top of :func:`model_supports_vision`.
+    *Off by default* — the per-route render is the slowest part of a
+    routing call, so ``KICAD_MCP_RENDER_ROUTE_PNG=0`` is the baseline
+    and an explicit ``=1`` opts a vision-capable model into the rendered
+    image block.  A text-only model is always off — the base capability
+    check gates it.  The render toggle never changes the output *fields*
+    (the JSON envelope has no ``route_png`` key either way); it only
+    decides whether an image content block is attached to the tool
+    result.
+    """
+    if not model_supports_vision():
+        return False
+    raw = os.environ.get("KICAD_MCP_RENDER_ROUTE_PNG", "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def route_frame_budget() -> int:
+    """Per-call cap on image frames attached to one routing-tool result.
+
+    ``KICAD_MCP_ROUTE_FRAME_BUDGET`` (default ``1``): a single
+    ``pcb_route_pad_to_pad`` call produces at most one frame today — the
+    routed route PNG or the failure evidence, never both — so the budget
+    in effect is ``min(parsed, 1)``; ``0`` suppresses the image block
+    entirely (text envelope only).  Session- or loop-level frame counting
+    would require state on the plugin side: the MCP server tools are
+    stateless single calls, so the per-call cap + the envelope's
+    ``frame_budget`` report is the accounting this side can truthfully
+    provide.  Non-numeric or negative values fall back to the default.
+    """
+    raw = os.environ.get("KICAD_MCP_ROUTE_FRAME_BUDGET", "1").strip()
+    try:
+        budget = int(raw)
+    except ValueError:
+        return 1
+    return max(0, min(budget, 1))
+
+
+# ---------------------------------------------------------------------------
 # Module-level singleton instance
 # ---------------------------------------------------------------------------
 

@@ -33,6 +33,8 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
     "find_component_connections": ToolPolicy(kind="query"),
     # Project tools
     "get_project_structure": ToolPolicy(kind="query", path_arg="project_path"),
+    "list_projects": ToolPolicy(kind="query"),
+    "open_project": ToolPolicy(kind="ipc_action", path_arg="project_path"),
     # Symbol tools
     "sync_symbol_index": ToolPolicy(kind="indexing"),
     "get_symbol_sync_status": ToolPolicy(kind="query"),
@@ -173,6 +175,18 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
         mark_dirty=True,
     ),
     # PCB library/index tools
+    "add_footprints_to_pcb": ToolPolicy(
+        kind="file_mutation",
+        path_arg="pcb_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
+    "remove_footprints_from_pcb": ToolPolicy(
+        kind="file_mutation",
+        path_arg="pcb_path",
+        auto_snapshot=True,
+        mark_dirty=True,
+    ),
     "sync_footprint_index": ToolPolicy(kind="indexing"),
     "get_footprint_sync_status": ToolPolicy(kind="query"),
     "list_footprint_libraries": ToolPolicy(kind="query"),
@@ -444,6 +458,14 @@ TOOL_POLICIES: dict[str, ToolPolicy] = {
         track_snapshot=True,
         mark_dirty=True,
     ),
+    # Full-profile tools (Claude Desktop etc.) — project management, validation,
+    # BOM/pattern analysis and export. None of these mutate project files, so
+    # no snapshot/dirty flags.
+    "validate_project": ToolPolicy(kind="query", path_arg="project_path"),
+    "identify_circuit_patterns": ToolPolicy(kind="query", path_arg="schematic_path"),
+    "analyze_bom": ToolPolicy(kind="query", path_arg="project_path"),
+    "export_bom_csv": ToolPolicy(kind="query", path_arg="project_path"),
+    "generate_pcb_thumbnail": ToolPolicy(kind="query", path_arg="project_path"),
 }
 
 
