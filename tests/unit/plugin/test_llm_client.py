@@ -1,6 +1,7 @@
 """Tests for LLMClient history management (dedup + compaction)."""
 
 import datetime
+import http.client
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
@@ -9,6 +10,7 @@ import re
 import ssl
 import sys
 import threading
+import time
 import types
 from unittest.mock import ANY, MagicMock, patch
 import urllib.error
@@ -16,6 +18,7 @@ import urllib.error
 import pytest
 
 from kicad_plugin import llm_client
+from kicad_plugin import session_store as sstore
 from kicad_plugin.llm_client import LLMClient, _subprocess_sse_stream
 from kicad_plugin.settings import DEFAULT_LLM_USER_AGENT
 from kicad_plugin.tool_registry import TOOL_POLICIES
@@ -1019,23 +1022,19 @@ class TestRunIntegration:
             result = client.run("move R1", context_block="", on_tool_call=on_tool_call)
 
         assert result == "done"
-        assert mock_call_tool.call_args_list == [
-            ((client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),),
+        assert [c.args for c in mock_call_tool.call_args_list] == [
+            (client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),
             (
-                (
-                    client._mcp_base_url,
-                    "save_project_version",
-                    {"project_file": "/tmp/board.kicad_pro"},
-                ),
+                client._mcp_base_url,
+                "save_project_version",
+                {"project_file": "/tmp/board.kicad_pro"},
             ),
             (
-                (
-                    client._mcp_base_url,
-                    "set_footprint_position",
-                    {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]},
-                ),
+                client._mcp_base_url,
+                "set_footprint_position",
+                {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]},
             ),
-            ((client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),),
+            (client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),
         ]
         assert [call.args[0] for call in on_tool_call.call_args_list] == [
             "save_document",
@@ -1081,23 +1080,19 @@ class TestRunIntegration:
             result = client.run("route A1 to B2", context_block="", on_tool_call=on_tool_call)
 
         assert result == "done"
-        assert mock_call_tool.call_args_list == [
-            ((client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),),
+        assert [c.args for c in mock_call_tool.call_args_list] == [
+            (client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),
             (
-                (
-                    client._mcp_base_url,
-                    "save_project_version",
-                    {"project_file": "/tmp/board.kicad_pro"},
-                ),
+                client._mcp_base_url,
+                "save_project_version",
+                {"project_file": "/tmp/board.kicad_pro"},
             ),
             (
-                (
-                    client._mcp_base_url,
-                    "pcb_route_pad_to_pad",
-                    {"pcb_path": "/tmp/board.kicad_pcb", "pad1": "A1", "pad2": "B2"},
-                ),
+                client._mcp_base_url,
+                "pcb_route_pad_to_pad",
+                {"pcb_path": "/tmp/board.kicad_pcb", "pad1": "A1", "pad2": "B2"},
             ),
-            ((client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),),
+            (client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),
         ]
         assert [call.args[0] for call in on_tool_call.call_args_list] == [
             "save_document",
@@ -1144,8 +1139,10 @@ class TestRunIntegration:
             result = client.run("move R1", context_block="")
 
         assert result == "[LLM error] API down"
-        assert mock_call_tool.call_args_list[-1] == (
-            (client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),
+        assert mock_call_tool.call_args_list[-1].args == (
+            client._mcp_base_url,
+            "reload_kicad",
+            {"paths": ["/tmp/board.kicad_pcb"]},
         )
 
     def test_max_iterations_exit_still_reloads_dirty_path(self):
@@ -1177,7 +1174,7 @@ class TestRunIntegration:
         client._enabled_tools = {"set_footprint_position"}
 
         with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
-            mock_call_tool.side_effect = lambda base, name, args: (
+            mock_call_tool.side_effect = lambda base, name, args, timeout=None: (
                 {"success": True, "reloaded": ["/tmp/board.kicad_pcb"], "failed": []}
                 if name == "reload_kicad"
                 else {"success": True}
@@ -1190,9 +1187,11 @@ class TestRunIntegration:
         assert mock_call_tool.call_args_list[-1][0][1] == "reload_kicad"
         assert mock_call_tool.call_args_list[-1][0][2] == {"paths": ["/tmp/board.kicad_pcb"]}
 
-    def test_tool_exception_still_reloads_dirty_path(self):
-        """An exception escaping run() still flushes dirty paths from earlier
-        successful mutations in the same turn."""
+    def test_tool_exception_recorded_and_still_reloads_dirty_path(self):
+        """A tool raising mid-turn no longer escapes run() (issue #176): the
+        exception is captured as a recorded tool result so the failed call
+        keeps its history pair, and the end-of-turn reload still flushes dirty
+        paths from the earlier successful mutation."""
         client = _make_client()
         tool_response = {
             "finish_reason": "tool_calls",
@@ -1225,7 +1224,12 @@ class TestRunIntegration:
                 ],
             },
         }
-        client._call_llm = MagicMock(side_effect=[tool_response])
+        client._call_llm = MagicMock(
+            side_effect=[
+                tool_response,
+                {"finish_reason": "stop", "message": {"content": "done"}},
+            ]
+        )
         client._enabled_tools = {"set_footprint_position", "flip_footprint"}
 
         with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
@@ -1234,12 +1238,20 @@ class TestRunIntegration:
                 {"success": True, "version_id": "v1"},
                 {"success": True, "pcb_path": "/tmp/board.kicad_pcb"},
                 # flip_footprint reuses the same-turn snapshot (no save calls)
-                RuntimeError("boom"),  # flip_footprint raises
+                RuntimeError("boom"),  # flip_footprint raises → captured as result
                 {"success": True, "reloaded": ["/tmp/board.kicad_pcb"], "failed": []},
             ]
-            with pytest.raises(RuntimeError, match="boom"):
-                client.run("edit board", context_block="")
+            result = client.run("edit board", context_block="")
 
+        assert result == "done"
+        # The failing call has a recorded tool result carrying the exception.
+        failed = [
+            json.loads(m["content"])
+            for m in client._history
+            if m["role"] == "tool" and "boom" in m["content"]
+        ]
+        assert len(failed) == 1
+        assert failed[0]["success"] is False
         assert mock_call_tool.call_args_list[-1][0][1] == "reload_kicad"
         assert mock_call_tool.call_args_list[-1][0][2] == {"paths": ["/tmp/board.kicad_pcb"]}
 
@@ -1291,30 +1303,24 @@ class TestRunIntegration:
             result = client.run("edit board", context_block="")
 
         assert result == "done"
-        assert mock_call_tool.call_args_list == [
-            ((client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),),
+        assert [c.args for c in mock_call_tool.call_args_list] == [
+            (client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),
             (
-                (
-                    client._mcp_base_url,
-                    "save_project_version",
-                    {"project_file": "/tmp/board.kicad_pro"},
-                ),
+                client._mcp_base_url,
+                "save_project_version",
+                {"project_file": "/tmp/board.kicad_pro"},
             ),
             (
-                (
-                    client._mcp_base_url,
-                    "set_footprint_position",
-                    {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]},
-                ),
+                client._mcp_base_url,
+                "set_footprint_position",
+                {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]},
             ),
             (
-                (
-                    client._mcp_base_url,
-                    "flip_footprint",
-                    {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R2"},
-                ),
+                client._mcp_base_url,
+                "flip_footprint",
+                {"pcb_path": "/tmp/board.kicad_pcb", "reference": "R2"},
             ),
-            ((client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),),
+            (client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),
         ]
 
     def test_explicit_save_project_version_is_reused_by_later_mutation(self):
@@ -1369,22 +1375,18 @@ class TestRunIntegration:
             result = client.run("edit board", context_block="")
 
         assert result == "done"
-        assert mock_call_tool.call_args_list == [
+        assert [c.args for c in mock_call_tool.call_args_list] == [
             (
-                (
-                    client._mcp_base_url,
-                    "save_project_version",
-                    {"project_file": "/tmp/board.kicad_pro"},
-                ),
+                client._mcp_base_url,
+                "save_project_version",
+                {"project_file": "/tmp/board.kicad_pro"},
             ),
             (
-                (
-                    client._mcp_base_url,
-                    "set_footprint_position",
-                    {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]},
-                ),
+                client._mcp_base_url,
+                "set_footprint_position",
+                {"pcb_path": "/tmp/board.kicad_pcb", "items": [{"reference": "R1", "x": 1.0}]},
             ),
-            ((client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),),
+            (client._mcp_base_url, "reload_kicad", {"paths": ["/tmp/board.kicad_pcb"]}),
         ]
 
     def test_mutation_returns_error_when_auto_snapshot_fails(self):
@@ -1419,14 +1421,12 @@ class TestRunIntegration:
             result = client.run("move R1", context_block="")
 
         assert result == "done"
-        assert mock_call_tool.call_args_list == [
-            ((client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),),
+        assert [c.args for c in mock_call_tool.call_args_list] == [
+            (client._mcp_base_url, "save_document", {"file_path": "/tmp/board.kicad_pcb"}),
             (
-                (
-                    client._mcp_base_url,
-                    "save_project_version",
-                    {"project_file": "/tmp/board.kicad_pro"},
-                ),
+                client._mcp_base_url,
+                "save_project_version",
+                {"project_file": "/tmp/board.kicad_pro"},
             ),
         ]
         tool_result = json.loads(client._history[-2]["content"])
@@ -1524,6 +1524,451 @@ class TestRunIntegration:
         blocks = image_msgs[0]["content"]
         assert blocks[0]["type"] == "image_url"
         assert blocks[0]["image_url"]["url"] == "data:image/png;base64,QUJD"
+
+
+class TestMCPToolTimeoutAndInterrupt:
+    """Issue #176: long MCP tool calls must not be silently dropped.  A call
+    that exceeds the (configurable) threshold or is interrupted by Stop ends
+    the turn with an explicit error, and the failure is recorded in
+    llm_history (and therefore the session payload)."""
+
+    def _tool_response(self, name="get_board_info", args=None, call_id="tc1"):
+        return {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(args or {}),
+                        },
+                    }
+                ],
+            },
+        }
+
+    def test_call_mcp_tool_returns_timeout_dict_when_transport_blocks(self):
+        """call_mcp_tool itself must return a distinguishable timeout error
+        instead of hanging when the server keeps the stream alive past the
+        per-call deadline."""
+
+        def _blocking_urlopen(request, timeout=None):
+            time.sleep(10)  # server is streaming, no data comes
+            raise AssertionError("urlopen must be abandoned at the deadline")
+
+        with patch("urllib.request.urlopen", side_effect=_blocking_urlopen):
+            out = llm_client.call_mcp_tool("http://127.0.0.1:9", "some_tool", {}, timeout=0.05)
+
+        assert out["success"] is False
+        assert out["timed_out"] is True
+        assert "did not complete within" in out["error"]
+        assert "0.05" in out["error"]
+
+    def test_tool_call_over_threshold_times_out_and_ends_turn(self):
+        """A call longer than the configured threshold ends the turn with an
+        explicit timeout error; the tool result entry (with the reason) is
+        written into llm_history and the LLM is not re-invoked."""
+        client = _make_client()
+        client._mcp_tool_timeout = 0.05
+        client._call_llm = MagicMock(return_value=self._tool_response())
+
+        def _block(base_url, tool_name, args, timeout=None):
+            time.sleep(10)  # longer than the configured threshold
+            raise AssertionError("blocking call must be abandoned on timeout")
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_block):
+            result = client.run("do it", context_block="")
+
+        assert "[Error]" in result
+        assert "did not complete within" in result
+        tool_results = [m for m in client._history if m["role"] == "tool"]
+        assert len(tool_results) == 1
+        recorded = json.loads(tool_results[0]["content"])
+        assert recorded["success"] is False
+        assert recorded["timed_out"] is True
+        assert "did not complete within" in recorded["error"]
+        # The timeout must end the turn: no retry, no second LLM call.
+        client._call_llm.assert_called_once()
+
+    def test_cancel_event_interrupts_inflight_tool_call(self):
+        """Pressing Stop while a call is in flight records an interruption
+        error entry and ends the turn instead of dropping the call."""
+        client = _make_client()
+        client._mcp_tool_timeout = 30  # longer than the test window
+        client._call_llm = MagicMock(return_value=self._tool_response())
+        cancel = threading.Event()
+
+        def _block(base_url, tool_name, args, timeout=None):
+            time.sleep(10)
+            return {"success": True}
+
+        def _press_stop():
+            time.sleep(0.1)
+            cancel.set()
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_block):
+            stopper = threading.Thread(target=_press_stop)
+            stopper.start()
+            try:
+                result = client.run("do it", context_block="", cancel_event=cancel)
+            finally:
+                stopper.join(timeout=2)
+
+        assert "[Interrupted]" in result
+        assert "interrupted by user" in result
+        tool_results = [m for m in client._history if m["role"] == "tool"]
+        assert len(tool_results) == 1
+        recorded = json.loads(tool_results[0]["content"])
+        assert recorded["success"] is False
+        assert recorded["interrupted"] is True
+        assert "interrupted by user" in recorded["error"]
+        client._call_llm.assert_called_once()
+
+    def test_cancel_before_execution_skips_tool(self):
+        """A cancel set before the tool runs records the interruption without
+        executing (or waiting on) the tool at all."""
+        client = _make_client()
+        client._call_llm = MagicMock(return_value=self._tool_response())
+        cancel = threading.Event()
+        cancel.set()
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            result = client.run("do it", context_block="", cancel_event=cancel)
+
+        assert "[Interrupted]" in result
+        mock_call_tool.assert_not_called()
+        tool_results = [m for m in client._history if m["role"] == "tool"]
+        assert len(tool_results) == 1
+        assert json.loads(tool_results[0]["content"])["interrupted"] is True
+
+    def test_failed_call_result_written_into_session_payload(self):
+        """A failed tool call must write a result entry carrying the
+        server-side error into the session payload (llm_history), so the next
+        turn can see why the call failed."""
+        client = _make_client()
+        route_args = {
+            "pcb_path": "/tmp/board.kicad_pcb",
+            "ref_a": "U11",
+            "pad_a": "3v3",
+            "ref_b": "J2",
+            "pad_b": "3",
+            "net": "3v3",
+        }
+        client._call_llm = MagicMock(
+            side_effect=[
+                self._tool_response(name="pcb_route_pad_to_pad", args=route_args),
+                {"finish_reason": "stop", "message": {"content": "routing rejected"}},
+            ]
+        )
+        client._enabled_tools = {"pcb_route_pad_to_pad"}
+
+        def _server(base_url, name, args, timeout=None):
+            if name == "pcb_route_pad_to_pad":
+                return {"success": False, "error": "cannot shove track through U11"}
+            return {"success": True}
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_server):
+            result = client.run("route 3v3", context_block="")
+
+        assert result == "routing rejected"  # LLM saw the error and wrapped up
+        payload = sstore.make_payload([], client.get_history(), None, client.get_enabled_tools())
+        tool_msgs = [m for m in payload["llm_history"] if m["role"] == "tool"]
+        assert len(tool_msgs) == 1
+        recorded = json.loads(tool_msgs[0]["content"])
+        assert recorded["success"] is False
+        assert "cannot shove track through U11" in recorded["error"]
+
+    def _two_call_response(self):
+        """A batch of two tool calls (client-side our tool ids)."""
+        return {
+            "finish_reason": "tool_calls",
+            "message": {
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "tc1",
+                        "type": "function",
+                        "function": {"name": "get_board_info", "arguments": "{}"},
+                    },
+                    {
+                        "id": "tc2",
+                        "type": "function",
+                        "function": {"name": "get_schematic_components", "arguments": "{}"},
+                    },
+                ],
+            },
+        }
+
+    def _assert_all_tool_call_ids_answered(self, client):
+        """Every tool_call_id in the saved assistant message must have a
+        matching tool result entry (Anthropic pairing contract)."""
+        assistant_msgs = [
+            m for m in client._history if m["role"] == "assistant" and m.get("tool_calls")
+        ]
+        assert len(assistant_msgs) == 1
+        assistant_ids = {tc["id"] for tc in assistant_msgs[0]["tool_calls"]}
+        tool_results = [m for m in client._history if m["role"] == "tool"]
+        assert assistant_ids == {t["tool_call_id"] for t in tool_results}
+        return tool_results
+
+    def test_interrupted_batch_records_results_for_every_tool_call(self):
+        """Stop mid-batch: the unexecuted calls still get recorded results,
+        so no tool_call_id is left orphaned in llm_history."""
+        client = _make_client()
+        client._call_llm = MagicMock(return_value=self._two_call_response())
+        cancel = threading.Event()
+        cancel.set()
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            result = client.run("do it", context_block="", cancel_event=cancel)
+
+        assert "[Interrupted]" in result
+        mock_call_tool.assert_not_called()  # nothing in the batch was executed
+        tool_results = self._assert_all_tool_call_ids_answered(client)
+        assert len(tool_results) == 2
+        for m in tool_results:
+            recorded = json.loads(m["content"])
+            assert recorded["success"] is False
+            assert recorded["interrupted"] is True
+        client._call_llm.assert_called_once()
+
+    def test_timeout_batch_records_skip_results_for_remaining_calls(self):
+        """A timeout abort leaves no orphaned tool_call_id either: the calls
+        after the failing one are recorded as not executed, and the
+        remaining tool is never invoked."""
+        client = _make_client()
+        client._mcp_tool_timeout = 0.05
+        client._call_llm = MagicMock(return_value=self._two_call_response())
+
+        def _block(base_url, tool_name, args, timeout=None):
+            time.sleep(10)
+            raise AssertionError("blocking call must be abandoned on timeout")
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.side_effect = _block
+            result = client.run("do it", context_block="")
+
+        assert "[Error]" in result
+        assert mock_call_tool.call_count == 1  # the 2nd call was never executed
+        tool_results = self._assert_all_tool_call_ids_answered(client)
+        assert len(tool_results) == 2
+        timed_out = json.loads(tool_results[0]["content"])
+        assert timed_out["timed_out"] is True
+        skipped = json.loads(tool_results[1]["content"])
+        assert skipped["success"] is False
+        assert "not executed" in skipped["error"]
+        assert "interrupted" not in skipped
+
+    @pytest.mark.parametrize(
+        "exc",
+        [
+            ConnectionResetError("peer closed"),
+            ssl.SSLError(1, "tls fail"),
+            http.client.RemoteDisconnected("gone"),
+        ],
+    )
+    def test_transport_oserror_returns_failure_not_raise(self, exc):
+        """The worker's blanket exception handler must capture every
+        OSError-family transport failure — ConnectionResetError,
+        ssl.SSLError, RemoteDisconnected — into a structured failure instead
+        of letting it escape the turn (issue #176)."""
+        with patch("urllib.request.urlopen", side_effect=exc):
+            out = llm_client.call_mcp_tool("http://127.0.0.1:9", "pcb_route_pad_to_pad", {})
+        assert out["success"] is False
+        assert type(exc).__name__ in out["error"]
+
+    def test_mixed_batch_timeout_records_all_and_skips_tail(self):
+        """[executed-ok, blocking timeout, tail]: the executed call is
+        recorded normally, the timeout aborts with [Error], and the tail
+        gets a synthesized 'not executed' result — no orphaned id."""
+        client = _make_client()
+        client._mcp_tool_timeout = 0.05
+        client._call_llm = MagicMock(
+            return_value={
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "tc1",
+                            "type": "function",
+                            "function": {"name": "get_board_info", "arguments": "{}"},
+                        },
+                        {
+                            "id": "tc2",
+                            "type": "function",
+                            "function": {"name": "get_board_info", "arguments": "{}"},
+                        },
+                        {
+                            "id": "tc3",
+                            "type": "function",
+                            "function": {"name": "get_board_info", "arguments": "{}"},
+                        },
+                    ],
+                },
+            }
+        )
+
+        def _transport(base_url, tool_name, args, timeout=None):
+            calls[0] += 1
+            if calls[0] == 1:
+                return {"success": True}
+            time.sleep(10)  # second call blocks past the deadline
+            raise AssertionError("blocking call must be abandoned on timeout")
+
+        calls = [0]
+        with patch(
+            "kicad_plugin.llm_client.call_mcp_tool", side_effect=_transport
+        ) as mock_call_tool:
+            result = client.run("do it", context_block="")
+
+        assert "[Error]" in result
+        assert mock_call_tool.call_count == 2  # tc1 ok, tc2 blocked; tc3 never executed
+        tool_results = self._assert_all_tool_call_ids_answered(client)
+        assert len(tool_results) == 3
+        assert json.loads(tool_results[0]["content"])["success"] is True
+        assert json.loads(tool_results[1]["content"])["timed_out"] is True
+        skipped = json.loads(tool_results[2]["content"])
+        assert skipped["success"] is False
+        assert "not executed" in skipped["error"]
+
+    def test_image_result_relayed_when_aborting_call_times_out(self):
+        """An image-bearing tool result that lands before the aborting call
+        is still peeled and relayed (vision enabled), the timeout aborts,
+        and the interrupted tail still gets its synthesized result."""
+        client = _make_client()
+        client._mcp_tool_timeout = 0.05
+        client._settings.llm_supports_vision = True
+        client._call_llm = MagicMock(
+            return_value={
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "tc1",
+                            "type": "function",
+                            "function": {"name": "get_board_info", "arguments": "{}"},
+                        },
+                        {
+                            "id": "tc2",
+                            "type": "function",
+                            "function": {"name": "get_board_info", "arguments": "{}"},
+                        },
+                        {
+                            "id": "tc3",
+                            "type": "function",
+                            "function": {"name": "get_board_info", "arguments": "{}"},
+                        },
+                    ],
+                },
+            }
+        )
+
+        def _transport(base_url, tool_name, args, timeout=None):
+            calls[0] += 1
+            if calls[0] == 1:
+                return {
+                    "success": True,
+                    "text": "board rendered",
+                    "_image": {"media_type": "image/png", "data": "QUJD"},
+                }
+            time.sleep(10)  # second call blocks past the deadline
+            raise AssertionError("blocking call must be abandoned on timeout")
+
+        calls = [0]
+        with patch(
+            "kicad_plugin.llm_client.call_mcp_tool", side_effect=_transport
+        ) as mock_call_tool:
+            result = client.run("do it", context_block="")
+
+        assert "[Error]" in result
+        assert mock_call_tool.call_count == 2
+        tool_results = self._assert_all_tool_call_ids_answered(client)
+        assert len(tool_results) == 3
+        # Image peeled off the executed call's recorded result...
+        first = json.loads(tool_results[0]["content"])
+        assert first["success"] is True
+        assert "_image" not in first
+        # ...and relayed as an image_url user message despite the aborted turn.
+        image_msgs = [m for m in client._history if isinstance(m.get("content"), list)]
+        assert len(image_msgs) == 1
+        assert image_msgs[0]["content"][0]["image_url"]["url"] == "data:image/png;base64,QUJD"
+        assert json.loads(tool_results[1]["content"])["timed_out"] is True
+        assert "not executed" in json.loads(tool_results[2]["content"])["error"]
+
+    def test_arguments_null_tail_does_not_typeerror(self):
+        """A provider sending 'arguments': null (both on the aborting call
+        and on the unexecuted tail) must not raise TypeError from
+        json.loads(None) in either the main loop or the skip helper."""
+        client = _make_client()
+        client._call_llm = MagicMock(
+            return_value={
+                "finish_reason": "tool_calls",
+                "message": {
+                    "content": "",
+                    "tool_calls": [
+                        {
+                            "id": "tc1",
+                            "type": "function",
+                            "function": {"name": "get_board_info", "arguments": None},
+                        },
+                        {
+                            "id": "tc2",
+                            "type": "function",
+                            "function": {"name": "get_board_info", "arguments": None},
+                        },
+                    ],
+                },
+            }
+        )
+        cancel = threading.Event()
+        cancel.set()
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            result = client.run("do it", context_block="", cancel_event=cancel)
+
+        assert "[Interrupted]" in result
+        mock_call_tool.assert_not_called()
+        tool_results = self._assert_all_tool_call_ids_answered(client)
+        assert len(tool_results) == 2
+        for m in tool_results:
+            assert json.loads(m["content"])["interrupted"] is True
+
+    def test_snapshot_phase_timeout_aborts_turn_with_marker(self):
+        """A Stop/deadline landing during the pre-tool snapshot phase must
+        carry the marker: the turn aborts with [Error] and records
+        timed_out, and the main tool never runs with a fresh deadline."""
+        client = _make_client()
+        client._mcp_tool_timeout = 0.05
+        client._call_llm = MagicMock(
+            return_value=self._tool_response(
+                name="pcb_route_pad_to_pad",
+                args={"pcb_path": "/tmp/board.kicad_pcb", "pad1": "A1", "pad2": "B2"},
+            )
+        )
+        client._enabled_tools = {"pcb_route_pad_to_pad"}
+
+        def _block(base_url, tool_name, args, timeout=None):
+            time.sleep(10)
+            raise AssertionError("blocking call must be abandoned on timeout")
+
+        with patch("kicad_plugin.llm_client.call_mcp_tool") as mock_call_tool:
+            mock_call_tool.side_effect = _block  # save_document blocks
+            result = client.run("route A1 to B2", context_block="")
+
+        assert "[Error]" in result
+        assert "did not complete within" in result
+        assert mock_call_tool.call_count == 1  # save_document only; snapshot+tool skipped
+        tool_results = self._assert_all_tool_call_ids_answered(client)
+        assert len(tool_results) == 1
+        recorded = json.loads(tool_results[0]["content"])
+        assert recorded["success"] is False
+        assert recorded["timed_out"] is True
+        client._call_llm.assert_called_once()
 
 
 class TestToolPolicyRegistry:
@@ -3187,7 +3632,7 @@ class TestToolDirectRequest:
         client = _make_client()
         calls = []
 
-        def _boom(base_url, tool_name, args):
+        def _boom(base_url, tool_name, args, timeout=None):
             raise RuntimeError("backend down")
 
         with patch("kicad_plugin.llm_client.call_mcp_tool", side_effect=_boom):
@@ -3976,6 +4421,26 @@ class TestCallMcpToolImageKey:
         )
         assert out["ok"] == 1
         assert out["_image"] == {"media_type": "image/png", "data": "QUJD"}
+
+    def test_socket_timeout_returns_failure_not_raise(self):
+        """#176: a slow MCP tool call makes ``urlopen`` raise
+        ``TimeoutError`` (a.k.a. socket.timeout).  That used to escape
+        call_mcp_tool -- the LLM turn was killed mid-reply with no tool
+        result recorded.  It must come back as a structured failure so
+        the model sees the timeout and keeps the turn alive."""
+        with patch("urllib.request.urlopen", side_effect=TimeoutError("timed out")):
+            out = llm_client.call_mcp_tool("http://127.0.0.1:9", "pcb_route_pad_to_pad", {})
+        assert out["success"] is False
+        assert "timed out" in out["error"]
+
+    def test_unreachable_server_still_returns_failure(self):
+        with patch(
+            "urllib.request.urlopen",
+            side_effect=urllib.error.URLError("connection refused"),
+        ):
+            out = llm_client.call_mcp_tool("http://127.0.0.1:9", "pcb_route_pad_to_pad", {})
+        assert out["success"] is False
+        assert "unreachable" in out["error"]
 
 
 # Amazon Bedrock provider: OpenAI-compatible endpoint with bearer (Bedrock

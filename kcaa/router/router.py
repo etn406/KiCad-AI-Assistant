@@ -54,7 +54,7 @@ from __future__ import annotations
 
 from collections import deque
 from collections.abc import Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 import json
 import logging
 import math
@@ -202,6 +202,16 @@ class RouteRequest:
     waypoints: list[dict] = field(default_factory=list)
     dry_run: bool = False  # tool-layer hint: skip save_pcb (router never writes)
 
+    pad_b_override: (
+        tuple[
+            tuple[float, float],  # pad_b center (world xy)
+            tuple[float, float] | None,  # pad_b size (w, h); None = custom pad w/o (size ...)
+            str | None,  # pad_b net
+            frozenset[str],  # pad_b copper layers
+        ]
+        | None
+    ) = None  # internal: candidate pad for auto-retry; not a user knob
+
 
 @dataclass
 class RouteResult:
@@ -260,7 +270,7 @@ class RouteResult:
 # ---------------------------------------------------------------------------
 
 
-def auto_route_pair(req: RouteRequest) -> RouteResult:
+def auto_route_pair(req: RouteRequest, data: list | None = None) -> RouteResult:
     """Connect pad ``req.pad_a`` on ``req.ref_a`` to pad ``req.pad_b`` on
     ``req.ref_b`` on the same net ``req.net``.
 
@@ -268,13 +278,75 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     layer; thru-hole pads use a shared copper layer (preferring
     ``req.layer_hint``).
 
+    *data* is an optional pre-parsed PCB S-expression tree.  When given it
+    is used instead of the router's own ``load_pcb`` of ``req.pcb_path``;
+    when omitted the board is parsed here as before.  Nested
+    multi-candidate retry calls reuse the outer frame's tree, and the
+    world model is built from that same tree, so a multi-pad footprint
+    costs exactly ONE router-level board parse for the whole retry instead
+    of one per candidate.  Scope of the sharing: only the router's own PCB
+    parse (``load_pcb`` + the world model derived from it) is reused —
+    the .kicad_pro DRC loads (track width / clearance / via size) still
+    re-read their files per candidate, exactly as before.  The tree is
+    read-only across the router: every consumer is a pure lookup and the
+    engines operate on separately-built obstacle grids, so sharing it
+    across the retry candidates cannot contaminate one candidate with
+    another's attempt (the file is never written during routing).
+
+    Candidate selection for multi-pad footprints: when ``req.ref_b``
+    declares several pads named ``req.pad_b`` (e.g. edge-connector
+    fingers sharing a net, or a THT pad next to SMD fingers), the
+    first-declared pad may sit in a dead zone while a later member is
+    trivially routable.  Each same-named candidate on the resolved
+    ``end_layer`` is tried in turn, closest-to-``pad_a`` first; the
+    first routing attempt that succeeds wins.  The per-candidate result
+    is identical to what a single-pad request would produce.
+
     Returns:
         A :class:`RouteResult` containing the segments and (optionally) vias.
 
     Raises:
-        RouteFailure: If no path is found or inputs are invalid.
+        RouteFailure: If no path is found or inputs are invalid.  When
+            every same-named candidate fails, the message aggregates
+            each candidate's own failure.
     """
-    data = load_pcb(req.pcb_path)
+    # A nested retry call carries the candidate resolved by the outer
+    # frame; it must not re-enumerate (that would loop forever).
+    if req.pad_b_override is None:
+        data0 = data if data is not None else load_pcb(req.pcb_path)
+        start_layer0, end_layer0 = _resolve_layers(data0, req)
+        pad_a0 = _find_pad_center(data0, req.ref_a, req.pad_a, start_layer0)
+        candidates = _collect_pad_candidates(data0, req.ref_b, req.pad_b, end_layer0)
+        if len(candidates) > 1:
+            ranked = _rank_pad_candidates(candidates, pad_a0)
+            failures: list[str] = []
+            seen_msgs: set[str] = set()
+            for cand in ranked:
+                center, size, net, layers = cand
+                sub = replace(
+                    req,
+                    pad_b_override=(center, size, net, layers),
+                )
+                try:
+                    return auto_route_pair(sub, data=data0)
+                except RouteFailure as exc:
+                    # One line per candidate: engine failure texts can
+                    # run several sentences, and several candidates all
+                    # failing the same way would blow up the message.
+                    first_line = str(exc).splitlines()[0] if str(exc) else "route failed"
+                    msg = f"pad at ({center[0]:.3f}, {center[1]:.3f}): {first_line}"
+                    if msg not in seen_msgs:
+                        seen_msgs.add(msg)
+                        failures.append(msg)
+            raise RouteFailure(
+                f"None of the {len(ranked)} pads named {req.pad_b!r} on "
+                f"{req.ref_b} routed to {req.ref_a}/{req.pad_a}: " + " ; ".join(failures)
+            )
+        # Single-pad (or first-of-multi, no retry) path: reuse the board
+        # already parsed above instead of loading it a second time.
+        data = data0
+    else:
+        data = data if data is not None else load_pcb(req.pcb_path)
 
     # Validate the routing algorithm selector early.
     if req.algorithm not in ("astar", "pns"):
@@ -341,7 +413,21 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     # Pad center coordinates. The layer keeps center and size on the SAME
     # pad when a footprint declares several pads with one name.
     pad_a_xy = _find_pad_center(data, req.ref_a, req.pad_a, start_layer)
-    pad_b_xy = _find_pad_center(data, req.ref_b, req.pad_b, end_layer)
+    if req.pad_b_override is not None:
+        # Nested retry call: the candidate pad is pinned -- its center,
+        # size, net and layers are the resolved ones, so every lookup
+        # below must use them instead of re-resolving the first
+        # same-named pad.
+        pad_b_xy = req.pad_b_override[0]
+        pad_b_size_override = req.pad_b_override[1]
+        pad_b_net_override = req.pad_b_override[2]
+        pad_b_layers_override = req.pad_b_override[3]
+    else:
+        # Regular (single-pad or first-of-multi) resolution.
+        pad_b_xy = _find_pad_center(data, req.ref_b, req.pad_b, end_layer)
+        pad_b_size_override = None
+        pad_b_net_override = None
+        pad_b_layers_override = None
     if pad_a_xy is None:
         if _find_pad_center(data, req.ref_a, req.pad_a) is None:
             raise RouteFailure(f"Pad {req.ref_a}/{req.pad_a} not found")
@@ -364,21 +450,42 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
             f"Pad {req.ref_a}/{req.pad_a} has no copper shape on layer "
             f"{start_layer!r}; cannot route from there."
         )
-    if _find_pad_size(data, req.ref_b, req.pad_b, end_layer) is None:
-        raise RouteFailure(
-            f"Pad {req.ref_b}/{req.pad_b} has no copper shape on layer "
-            f"{end_layer!r}; cannot route to there."
-        )
+    pad_b_size_from_board = _find_pad_size(data, req.ref_b, req.pad_b, end_layer)
+    if req.pad_b_override is not None:
+        if pad_b_size_override is None:
+            # Candidate pinned by retry: it must carry its OWN size.  A
+            # custom pad without a (size ...) node cannot be resolved to
+            # a concrete pad shape -- fail this candidate honestly
+            # instead of silently borrowing a sibling pad's size (which
+            # would pad-AABB-clear the wrong footprint area).
+            raise RouteFailure(
+                f"Pad {req.ref_b}/{req.pad_b} candidate at "
+                f"({pad_b_xy[0]:.3f}, {pad_b_xy[1]:.3f}) declares no pad size; "
+                "cannot route to it."
+            )
+        pad_b_size = pad_b_size_override
+    else:
+        if pad_b_size_from_board is None:
+            raise RouteFailure(
+                f"Pad {req.ref_b}/{req.pad_b} has no copper shape on layer "
+                f"{end_layer!r}; cannot route to there."
+            )
+        pad_b_size = pad_b_size_from_board
 
     # Early net check: pads on different nets must not be routed together.
     # A foreign-net pad is an obstacle -- past the net check the world model
     # would dutifully treat it as one and fail deep inside A*, so fail fast
     # with the actual cause.
-    for ref, pad, layer in (
-        (req.ref_a, req.pad_a, start_layer),
-        (req.ref_b, req.pad_b, end_layer),
+    for ref, pad, layer, override_net in (
+        (req.ref_a, req.pad_a, start_layer, None),
+        (
+            req.ref_b,
+            req.pad_b,
+            end_layer,
+            pad_b_net_override,
+        ),
     ):
-        pad_net = _find_pad_net(data, ref, pad, layer)
+        pad_net = override_net if override_net is not None else _find_pad_net(data, ref, pad, layer)
         if pad_net is not None and pad_net != req.net:
             raise RouteFailure(
                 f"Pad {ref}/{pad} is on net {pad_net!r}, not the requested "
@@ -393,6 +500,10 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
     model = build_world_model(
         req.pcb_path,
         net_filter=req.net,
+        # Same tree the geometry lookups above use: identical content by
+        # construction (the file is not written during routing) and it
+        # keeps the multi-candidate retry at one board parse total.
+        data=data,
     )
 
     # Shrink obstacles by half the trace width (so the track is centered on
@@ -420,7 +531,8 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
         return local_w, local_h
 
     pad_a_size = _find_pad_size(data, req.ref_a, req.pad_a, start_layer)
-    pad_b_size = _find_pad_size(data, req.ref_b, req.pad_b, end_layer)
+    # pad_b_size was resolved by the guard above (override candidate's
+    # own size, or the first same-named pad's when no retry).
     pad_a_world_size = (
         _world_size(pad_a_size[0], pad_a_size[1], _fp_rotation(data, req.ref_a))
         if pad_a_size
@@ -1629,7 +1741,15 @@ def auto_route_pair(req: RouteRequest) -> RouteResult:
                     # copper layers is a valid terminus -- only an SMD
                     # pad (fixed to one layer) must match ``end_layer``
                     # exactly.
-                    if _find_pad_center(data, req.ref_b, req.pad_b, pending_layer) is None:
+                    if pad_b_layers_override is not None:
+                        # Candidate pad pinned by retry: judge the
+                        # candidate's own copper layers.
+                        pad_b_has_pending = pending_layer in pad_b_layers_override
+                    else:
+                        pad_b_has_pending = (
+                            _find_pad_center(data, req.ref_b, req.pad_b, pending_layer) is not None
+                        )
+                    if not pad_b_has_pending:
                         raise RouteFailure(
                             f"anchor chain ends on layer {pending_layer!r} but pad "
                             f"{req.ref_b}/{req.pad_b} is on {end_layer!r}; add a via "
@@ -3814,6 +3934,81 @@ def _resolve_layers(
                 end_layer = chosen
 
     return start_layer, end_layer
+
+
+def _collect_pad_candidates(
+    data: list,
+    ref: str,
+    pad_name: str,
+    layer: str,
+) -> list[
+    tuple[
+        tuple[float, float],  # world center (x, y)
+        tuple[float, float],  # pad size (w, h)
+        str | None,  # net
+        frozenset[str],  # copper layers
+    ]
+]:
+    """All same-named pads on ``ref`` whose copper covers ``layer``.
+
+    A footprint may declare several pads with one name (edge-connector
+    fingers sharing a net, or a THT pad next to SMD fingers).  The
+    first-declared pad may sit in a dead zone while a later one is
+    trivially routable, so candidate routing tries every member; this
+    helper lists them (order = declaration order, so the caller can
+    rank by proximity itself).
+    """
+    fp = _find_footprint(data, ref)
+    if fp is None:
+        return []
+    fp_x, fp_y, fp_rot = _node_at3(fp)
+    out: list[tuple[tuple[float, float], tuple[float, float], str | None, frozenset[str]]] = []
+    for sub in fp:
+        if not _is_list(sub) or str(sub[0]) != "pad":
+            continue
+        if _get_pad_name(sub) != pad_name:
+            continue
+        copper = frozenset(_pad_layers(sub))
+        if layer not in copper:
+            continue
+        at = _get_sub(sub, "at")
+        if at is None or len(at) < 3:
+            continue
+        try:
+            px, py = float(at[1]), float(at[2])
+        except (TypeError, ValueError):
+            continue
+        wx, wy = _rotate(px, py, fp_rot)
+        # Per-candidate size: the candidate's OWN ``size`` node, NOT the
+        # first same-named pad's (that is what _find_pad_size returns).
+        size: tuple[float, float] | None = None
+        size_sub = _get_sub(sub, "size")
+        if size_sub is not None and len(size_sub) >= 3:
+            try:
+                size = (float(size_sub[1]), float(size_sub[2]))
+            except (TypeError, ValueError):
+                size = None
+        out.append(((fp_x + wx, fp_y + wy), size, _get_net(sub), copper))
+    return out
+
+
+def _rank_pad_candidates(
+    candidates: list[tuple[tuple[float, float], tuple[float, float], str | None, frozenset[str]]],
+    near: tuple[float, float] | None,
+) -> list[tuple[tuple[float, float], tuple[float, float], str | None, frozenset[str]]]:
+    """Same-named pad candidates, closest-to-``near`` first.
+
+    ``near`` is the opposite endpoint's world center.  Pads closer to
+    the counterpart need less track and generally route more easily
+    (a THT pad next to the connector wins over a far SMD finger).
+    Ties keep declaration order (stable sort).
+    """
+    return sorted(
+        candidates,
+        key=lambda c: (
+            (c[0][0] - near[0]) ** 2 + (c[0][1] - near[1]) ** 2 if near is not None else 0.0
+        ),
+    )
 
 
 def _same_net_pad_polygons(
