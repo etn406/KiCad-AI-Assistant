@@ -20,10 +20,11 @@ import platform
 import random
 import secrets
 import subprocess  # nosec B404 -- controlled subprocess execution, no user input
+import threading
 import time
 from typing import Any
 
-from .tool_registry import get_missing_tool_policies, get_tool_policy
+from .tool_registry import TOOL_POLICIES, get_missing_tool_policies, get_tool_policy
 
 log = logging.getLogger(__name__)
 
@@ -208,13 +209,37 @@ def _load_skill_catalog_entries() -> list[dict[str, str]]:
     return sorted(skills, key=lambda s: (-int(s["priority"]), s["name"]))
 
 
+# Static category → skill fast-path for the prompt-level catalog. Hardcoded
+# (not derived from the skill directory) so the system prompt stays
+# size-stable regardless of skill authoring; list_skills() remains the
+# authoritative, always-current catalog for everything else.
+_SKILL_CATEGORY_GUIDE = (
+    "Skills are organized by task category — `list_skills()` lists the how-to "
+    "guides for MCP tools and `get_skill(name)` loads the one matching your "
+    "task: routing→pcb-routing, placement→pcb-placement/schematic-placement, "
+    "DRC→drc-rules, wiring→schematic-wiring, symbol→symbol-edit/symbol-library, "
+    "geometry→pcb-outline/pcb-zone, footprint→pcb-footprint-library, "
+    "query→pcb-query, sheet→sheet-management."
+)
+
+
 def _build_skill_catalog_block() -> str:
-    """Render a compact catalog of available on-demand workflow skills."""
+    """Render the category guide plus the full ``- name: description`` list.
+
+    Every line comes from the skill front-matter via ``_load_skill_catalog_entries()``
+    (name falls back to the stem, description omitted when absent), so the block
+    never drifts from the authored skills.
+    """
     skills = _load_skill_catalog_entries()
     if not skills:
         return ""
-    names = ", ".join(skill["name"] for skill in skills)
-    return "# Skills\n" + names
+    lines = [
+        f"- {skill['name']}: {skill['description']}"
+        if skill["description"]
+        else f"- {skill['name']}"
+        for skill in skills
+    ]
+    return "# Skills\n" + _SKILL_CATEGORY_GUIDE + "\n" + "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------
@@ -293,18 +318,22 @@ _META_TOOL_NAMES = frozenset({"enable_tool", "disable_tool", "get_tool_schema"})
 
 _TOOL_LOADING_PROMPT = (
     "\n\n## Tool loading protocol\n"
-    "- Only enabled tools are callable; their schemas are included in every request.\n"
-    "- Call `enable_tool(tools=[...])` to activate a batch — schemas appear in the "
-    "next request, in catalog order.\n"
-    "- Plan ahead: enable every tool the task may need in ONE batch up front. Avoid "
-    "per-step toggling — each enable/disable rewrites the tools segment and loses "
-    "the provider cache on it.\n"
-    "- Keep tools enabled for the whole task; call `disable_tool` only once a tool is "
-    "clearly no longer needed.\n"
-    "- `get_tool_schema(name)` previews the schema of a tool that is NOT enabled "
-    "(enabled schemas are already in context).\n"
-    "- Calls to tools that are not enabled are rejected — enable them first.\n"
-    "- Do one enable round per task, then execute."
+    "- All catalog tools are callable immediately — `enable_tool` is optional "
+    "and only pins a tool's schema into every request for repeated use.\n"
+    "- `enable_tool(tools=[...])` activates a batch; schemas appear in the next "
+    "request, in catalog order. `disable_tool` drops them when done.\n"
+    "- Prefer `get_tool_schema(tools=[...])` for parameter lookups — it previews "
+    "schemas WITHOUT enabling and never touches the tools segment or provider "
+    "cache; call `enable_tool` only for tools you will use repeatedly.\n"
+    "- Tool calls are rejected only for unknown names (not in the catalog) or "
+    "tools with no execution policy — otherwise they run directly.\n"
+    "- Workflow skills: `list_skills()` lists how-to guides for using MCP tools; "
+    "`get_skill(name)` loads the one matching your task's category (routing, "
+    "placement, DRC, …). Load it BEFORE executing task tools — the guides carry "
+    "the correct workflows and pitfalls (waypoints/vias, spacing, pin choice) "
+    "that bare `get_tool_schema` parameter schemas cannot convey.\n"
+    "- Avoid per-step enable/disable toggling — each one rewrites the tools "
+    "segment and loses the provider cache on it; do one enable round per task."
 )
 
 _META_TOOL_DEFS: list[dict[str, Any]] = [
@@ -356,18 +385,25 @@ _META_TOOL_DEFS: list[dict[str, Any]] = [
         "function": {
             "name": "get_tool_schema",
             "description": (
-                "Preview the full schema of one tool that is currently NOT enabled. Enabled "
-                "tools already have their schema in context and are rejected here."
+                "Preview parameter schemas of one or more tools — all catalog tools are "
+                "callable regardless; use this mainly for tools that are NOT enabled "
+                "(their schema is absent from your request) so you call them with "
+                "correct arguments. Pass a `tools` batch (or legacy `tool_name`); "
+                "enabled tools are skipped (schema already in context)."
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
+                    "tools": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Exact tool names from the catalog to preview as a batch.",
+                    },
                     "tool_name": {
                         "type": "string",
-                        "description": "Exact tool name from the catalog.",
-                    }
+                        "description": "Exact single tool name (legacy; prefer `tools`).",
+                    },
                 },
-                "required": ["tool_name"],
             },
         },
     },
@@ -985,8 +1021,7 @@ You are a KiCad assistant — modest, cautious, and proactive.
 - Edit schematics/PCBs via MCP tools.
 - Unless asked, never call `save_project_version`, `reload_kicad`,
   `check_kicad_ipc_connection`, or `save_document`.
-- The framework handles snapshots/reloads. Use ``list_skills()`` /
-  ``get_skill(name)`` for guides.\
+- The framework handles snapshots/reloads.\
 """
 
 _PROMPT_SCHEMATIC = """\
@@ -1001,19 +1036,17 @@ _PROMPT_SCHEMATIC = """\
   0°=unrotated, 90°=tilt left, 180°=flipped, 270°=tilt right.
 - The schematic grid is **1.27 mm (50 mil)**. add_symbol_to_schematic and
   move_component snap automatically; rotation is restricted to 0/90/180/270.
-- Default sheet is **A4 (297 x 210 mm)**. At the start of each request
-  that involves spatial changes, call get_schematic_sheet_info once to
-  confirm the actual paper size and to learn the recommended drawing area
-  (it accounts for the title block).
+- Default sheet is **A4 (297 x 210 mm)**. For spatial changes, call
+  get_schematic_sheet_info once to confirm the actual paper size and the
+  recommended drawing area (title-block aware).
 
 # Hard rules (schematic)
 - Always call extract_schematic_netlist (or get_schematic_sheet_info) for
   state before making spatial changes. Never invent coordinates.
 - Use the active_schematic path from the context block below as the
   schematic_path argument for every editing tool.
-- Every mutation tool automatically writes a .kicad_sch.bak backup and saves
-  to disk. The plugin framework handles the version snapshot and final
-  `reload_kicad(...)` call automatically for successful file mutations.
+- Mutations auto-write a .kicad_sch.bak backup; the framework handles the
+  version snapshot and final reload automatically.
 - Report errors clearly. Do not silently retry failed tool calls.
 - If find_free_area returns no candidates and no relative placement is
   appropriate, ASK the engineer instead of guessing a position.\
@@ -1039,9 +1072,8 @@ _PROMPT_PCB = """\
   Never invent footprint coordinates.
 - Use the active_pcb path from the context block below as the pcb_path
   argument for every PCB editing tool.
-- Every mutation tool automatically writes a .kicad_pcb.bak backup and saves
-  to disk. The plugin framework handles the version snapshot and final
-  `reload_kicad(...)` call automatically for successful file mutations.
+- Mutations auto-write a .kicad_pcb.bak backup; the framework handles the
+  version snapshot and final reload automatically.
 - Report errors clearly. Do not silently retry failed tool calls.
 - Do not overlap footprint courtyards.  Verify clearances with
   get_footprint_bbox / get_board_bounding_box before committing a move.\
@@ -1081,12 +1113,25 @@ def _parse_mcp_response_text(text: str) -> dict[str, Any]:
     return json.loads(last_data)
 
 
-def call_mcp_tool(base_url: str, tool_name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+def call_mcp_tool(
+    base_url: str,
+    tool_name: str,
+    arguments: dict[str, Any],
+    timeout: float = 30.0,
+) -> dict[str, Any]:
     """
     Call one MCP tool over HTTP and return the result dict.
 
     Uses urllib (stdlib only) so there is no extra dependency beyond what
     KiCad's bundled Python provides.
+
+    *timeout* is a wall-clock deadline for the whole call.  A long server
+    tool (e.g. PNS routing) can stream for minutes while keeping the socket
+    alive, so a socket-only timeout would never fire; the deadline is
+    enforced here by running the POST on a worker thread and abandoning it
+    when the deadline passes.  On abandonment the call returns a
+    distinguishable timeout error dict and the worker's late result is
+    discarded (issue #176).
     """
     import urllib.error
     import urllib.request
@@ -1112,40 +1157,75 @@ def call_mcp_tool(base_url: str, tool_name: str, arguments: dict[str, Any]) -> d
         },
         method="POST",
     )
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:  # nosec B310 -- MCP client, localhost only
-            body = _parse_mcp_response_text(resp.read().decode())
-    except urllib.error.URLError as e:
-        return {"success": False, "error": f"MCP server unreachable: {e}"}
-    except json.JSONDecodeError as e:
-        return {"success": False, "error": f"Invalid JSON from MCP server: {e}"}
 
-    if "error" in body:
-        return {"success": False, "error": body["error"].get("message", str(body["error"]))}
+    box: dict[str, Any] = {"done": False, "result": None}
 
-    result = body.get("result", {})
-    # FastMCP returns content as a list of {type, text} / {type, image} blocks
-    content = result.get("content", [])
-    image: dict[str, str] | None = None
-    if isinstance(content, list):
-        text = next((b for b in content if b.get("type") == "text"), None)
-        img = next((b for b in content if b.get("type") == "image"), None)
-        if img is not None:
-            image = {
-                "media_type": img.get("mimeType", "image/png"),
-                "data": img.get("data", ""),
+    def _post() -> None:
+        """Run the HTTP POST + parse in the worker; never raises."""
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:  # nosec B310 -- MCP client, localhost only
+                body = _parse_mcp_response_text(resp.read().decode())
+        except urllib.error.URLError as e:
+            box["result"] = {"success": False, "error": f"MCP server unreachable: {e}"}
+        except json.JSONDecodeError as e:
+            box["result"] = {"success": False, "error": f"Invalid JSON from MCP server: {e}"}
+        except Exception as e:  # e.g. read timeout / disconnect escaping urlopen
+            # Log the failure kind only — never the arguments/payload, which
+            # can carry paths or other local context.
+            log.warning("MCP tool call %s failed: %s: %s", tool_name, type(e).__name__, e)
+            box["result"] = {
+                "success": False,
+                "error": f"MCP tool call failed: {type(e).__name__}: {e}",
             }
-        if text is not None:
-            try:
-                out = json.loads(text.get("text", ""))
-            except json.JSONDecodeError:
-                out = {"success": True, "text": text.get("text", "")}
-            if isinstance(out, dict):
-                out["_image"] = image
-            return out
-    if image is not None:
-        return {"success": True, "_image": image}
-    return result
+        else:
+            if "error" in body:
+                box["result"] = {
+                    "success": False,
+                    "error": body["error"].get("message", str(body["error"])),
+                }
+            else:
+                result = body.get("result", {})
+                # FastMCP returns content as a list of {type, text} / {type, image} blocks
+                content = result.get("content", [])
+                image: dict[str, str] | None = None
+                if isinstance(content, list):
+                    text = next((b for b in content if b.get("type") == "text"), None)
+                    img = next((b for b in content if b.get("type") == "image"), None)
+                    if img is not None:
+                        image = {
+                            "media_type": img.get("mimeType", "image/png"),
+                            "data": img.get("data", ""),
+                        }
+                    if text is not None:
+                        try:
+                            out = json.loads(text.get("text", ""))
+                        except json.JSONDecodeError:
+                            out = {"success": True, "text": text.get("text", "")}
+                        if isinstance(out, dict) and image is not None:
+                            out["_image"] = image
+                        box["result"] = out
+                    elif image is not None:
+                        box["result"] = {"success": True, "_image": image}
+                    else:
+                        box["result"] = result
+                else:
+                    box["result"] = result
+        finally:
+            box["done"] = True
+
+    worker = threading.Thread(target=_post, name=f"mcp-call-{tool_name}", daemon=True)
+    worker.start()
+    worker.join(timeout)
+    if not box["done"]:
+        # Deadline exceeded: the worker is still blocked reading the SSE
+        # stream.  Return a distinguishable timeout so the caller can record
+        # it instead of hanging (or worse, silently dropping) the turn.
+        return {
+            "success": False,
+            "error": f"MCP tool call {tool_name!r} did not complete within {timeout:g} seconds",
+            "timed_out": True,
+        }
+    return box["result"]
 
 
 def _is_retryable_llm_error(error: str) -> bool:
@@ -1199,6 +1279,8 @@ class LLMClient:
         )
         self._keep_recent_turns: int = getattr(settings, "llm_keep_recent_turns", 4)
         self._max_tokens: int = getattr(settings, "llm_max_tokens", 0)
+        # Per-call wall-clock deadline for MCP tool calls (issue #176).
+        self._mcp_tool_timeout: float = getattr(settings, "mcp_tool_timeout_seconds", 300)
         self._history: list[dict[str, Any]] = []
         # Tool schema management: full catalog cached per session; only
         # explicitly enabled schemas are sent, in stable catalog order, so the
@@ -1268,6 +1350,7 @@ class LLMClient:
         self,
         request: dict[str, Any],
         on_tool_call: Callable[[str, dict, Any], None] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> Any:
         """Execute a framework tool_direct request (e.g. auto footprint sync).
 
@@ -1323,7 +1406,9 @@ class LLMClient:
         )
         state = _ToolExecutionState()
         try:
-            result = self._execute_tool_with_policy(tool_name, args, state, on_tool_call)
+            result = self._execute_tool_with_policy(
+                tool_name, args, state, on_tool_call, cancel_event
+            )
         except Exception as exc:
             log.error("Direct tool %s failed: %s", tool_name, exc, exc_info=True)
             result = {"success": False, "error": str(exc)}
@@ -2242,14 +2327,130 @@ class LLMClient:
         except Exception as e:
             log.error("UI callback error in _emit_tool_callback: %s", e)  # must not break the loop
 
+    def _call_mcp_tool_guarded(
+        self,
+        tool_name: str,
+        args: dict[str, Any],
+        cancel_event: threading.Event | None,
+    ) -> dict[str, Any]:
+        """Call one MCP tool with the per-call timeout AND Stop-awareness.
+
+        The actual HTTP call runs on a daemon worker so this method can
+        observe *cancel_event* while the transport is blocked reading a
+        long-lived SSE stream (issue #176).  On cancellation the call is
+        abandoned — its late result is discarded — and a distinguishable
+        interruption error dict is returned so the turn records the reason
+        instead of dropping the call silently.  The worker only owns the
+        socket: all framework/plugin-side logic (snapshot bookkeeping,
+        pcbnew post-processing) stays on the caller's thread.
+        """
+        box: dict[str, Any] = {}
+        done = threading.Event()
+
+        def _run() -> None:
+            try:
+                box["result"] = call_mcp_tool(
+                    self._mcp_base_url, tool_name, args, timeout=self._mcp_tool_timeout
+                )
+            except Exception as e:  # transport safety net — never lose the error
+                box["result"] = {
+                    "success": False,
+                    "error": f"MCP tool call failed: {type(e).__name__}: {e}",
+                }
+            finally:
+                done.set()
+
+        threading.Thread(target=_run, name=f"mcp-guard-{tool_name}", daemon=True).start()
+
+        deadline = time.monotonic() + self._mcp_tool_timeout
+        while True:
+            if cancel_event is not None and cancel_event.is_set():
+                return {
+                    "success": False,
+                    "error": f"tool call {tool_name} interrupted by user",
+                    "interrupted": True,
+                }
+            if done.wait(0.05):
+                return box["result"]
+            # Belt-and-suspenders deadline: call_mcp_tool enforces the same
+            # timeout internally, but a caller must never wait longer than the
+            # configured threshold even if the transport misbehaves.
+            if time.monotonic() >= deadline:
+                return {
+                    "success": False,
+                    "error": (
+                        f"tool call {tool_name} did not complete within "
+                        f"{self._mcp_tool_timeout:g} seconds"
+                    ),
+                    "timed_out": True,
+                }
+
+    def _skip_remaining_tool_calls(
+        self,
+        tool_calls: list[dict[str, Any]],
+        from_index: int,
+        on_tool_call: Callable[[str, dict[str, Any], Any], None] | None,
+        tool_results: list[dict[str, Any]],
+        interrupted: bool,
+    ) -> None:
+        """Record synthetic results for tool calls skipped when a batch aborts.
+
+        When the aborting call (at *from_index*) was interrupted or timed
+        out, the rest of the batch is deliberately NOT executed.  Those
+        calls still need a recorded result entry: the assistant ``tool_calls``
+        message is already in *self._history*, and every ``tool_call_id`` in
+        it must have a matching ``role: "tool"`` result or the next turn's
+        provider request fails the tool_result pairing (issue #176).
+        """
+        reason = (
+            "interrupted by user"
+            if interrupted
+            else "not executed: a previous tool call in the batch timed out"
+        )
+        for tc in tool_calls[from_index + 1 :]:
+            name = tc["function"]["name"]
+            try:
+                # ``or "{}"`` also covers providers sending "arguments": null
+                # (json.loads(None) would otherwise raise TypeError).
+                args = json.loads(tc["function"].get("arguments") or "{}")
+            except json.JSONDecodeError:
+                args = {}
+            result: dict[str, Any] = {
+                "success": False,
+                "error": f"tool call {name} {reason}",
+            }
+            if interrupted:
+                result["interrupted"] = True
+            self._emit_tool_callback(on_tool_call, name, args, result)
+            tool_results.append(
+                {"role": "tool", "tool_call_id": tc["id"], "content": json.dumps(result)}
+            )
+
+    @staticmethod
+    def _failure_carrying_markers(result: dict[str, Any], error: str) -> dict[str, Any]:
+        """Synthesize a failure dict carrying *result*'s interrupted /
+        timed_out marker, so a Stop/deadline that lands during the snapshot
+        phase still aborts run()'s tool loop (issue #176)."""
+        out: dict[str, Any] = {"success": False, "error": error}
+        for flag in ("interrupted", "timed_out"):
+            if result.get(flag):
+                out[flag] = True
+        return out
+
     def _execute_tool_with_policy(
         self,
         tool_name: str,
         args: dict[str, Any],
         state: _ToolExecutionState,
         on_tool_call: Callable[[str, dict, Any], None] | None,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
-        """Execute one tool call with framework-managed snapshot tracking."""
+        """Execute one tool call with framework-managed snapshot tracking.
+
+        *cancel_event* (the panel's Stop signal) is threaded into every MCP
+        call so a Stop press during a long tool call is recorded as an
+        interruption result instead of silently abandoning the turn.
+        """
 
         policy = get_tool_policy(tool_name)
         path = self._get_required_path(args, tool_name, policy.path_arg)
@@ -2268,9 +2469,19 @@ class LLMClient:
                 # Save the document in KiCad first to sync in-memory changes
                 # (e.g. from IPC operations) to disk before taking a snapshot.
                 save_args = {"file_path": path}
-                save_result = call_mcp_tool(self._mcp_base_url, "save_document", save_args)
+                save_result = self._call_mcp_tool_guarded("save_document", save_args, cancel_event)
                 self._emit_tool_callback(on_tool_call, "save_document", save_args, save_result)
                 if not self._tool_result_succeeded(save_result):
+                    if save_result.get("interrupted") or save_result.get("timed_out"):
+                        # Stop / deadline landed during the pre-save: abort the
+                        # turn here.  Marching on would give the snapshot and
+                        # the main call fresh deadlines (doubling the timeout
+                        # window), and the run() loop only aborts on the marker.
+                        return self._failure_carrying_markers(
+                            save_result,
+                            f"Failed to save document before {tool_name}: "
+                            f"{save_result.get('error', 'unknown error')}",
+                        )
                     log.warning(
                         "save_document failed before %s: %s",
                         tool_name,
@@ -2278,26 +2489,37 @@ class LLMClient:
                     )
 
                 snapshot_args = {"project_file": project_path}
-                snapshot_result = call_mcp_tool(
-                    self._mcp_base_url, "save_project_version", snapshot_args
+                snapshot_result = self._call_mcp_tool_guarded(
+                    "save_project_version", snapshot_args, cancel_event
                 )
                 self._emit_tool_callback(
                     on_tool_call, "save_project_version", snapshot_args, snapshot_result
                 )
                 if not self._tool_result_succeeded(snapshot_result):
                     error = snapshot_result.get("error", "unknown error")
-                    return {
-                        "success": False,
-                        "error": (f"Failed to save project version before {tool_name}: {error}"),
-                    }
+                    return self._failure_carrying_markers(
+                        snapshot_result,
+                        f"Failed to save project version before {tool_name}: {error}",
+                    )
                 state.snapshotted_paths.add(project_path)
 
-        result = call_mcp_tool(self._mcp_base_url, tool_name, args)
+        result = self._call_mcp_tool_guarded(tool_name, args, cancel_event)
 
         # Run plugin-side post-process hook (e.g. DRC marker reading via pcbnew)
         if policy.post_process is not None:
             result = policy.post_process(result)
 
+        _img = result.get("_image") if isinstance(result, dict) else None
+        if isinstance(_img, dict):
+            _img_desc = f"dict(data_len={len(_img.get('data', ''))})"
+        else:
+            _img_desc = repr(_img)
+        log.info(
+            "tool_call_flow emit_pre: name=%s result_keys=%s _image=%s",
+            tool_name,
+            sorted(result.keys()) if isinstance(result, dict) else type(result).__name__,
+            _img_desc,
+        )
         self._emit_tool_callback(on_tool_call, tool_name, args, result)
 
         # Mark the path dirty even when the tool call fails: a failed edit may
@@ -2436,7 +2658,6 @@ class LLMClient:
             }
 
         if name == "get_tool_schema":
-            tool_name = (args.get("tool_name") or "").strip()
             if self._tool_registry is None:
                 self._fetch_tool_definitions()
             registry = self._tool_registry or {}
@@ -2445,6 +2666,56 @@ class LLMClient:
                     "success": False,
                     "error": "Tool catalog unavailable (MCP server not reachable) — retry next turn.",
                 }
+            tools = args.get("tools")
+            if tools is not None:  # batch preview (primary interface)
+                if not isinstance(tools, list) or not tools:
+                    return {
+                        "success": False,
+                        "error": "Pass a non-empty 'tools' list of exact catalog names.",
+                    }
+                names = [str(t).strip() for t in tools]
+                unknown = [t for t in names if t not in registry]
+                if unknown:  # atomic: one bad name rejects the whole batch
+                    return {
+                        "success": False,
+                        "error": (
+                            "Unknown tool(s): "
+                            + ", ".join(map(repr, unknown))
+                            + " — use exact names from the catalog above."
+                        ),
+                        "suggestions": {
+                            t: difflib.get_close_matches(t, registry.keys(), n=5, cutoff=0.4)
+                            for t in unknown
+                        },
+                    }
+                previews: dict[str, Any] = {}
+                skipped = []
+                for t in names:
+                    if t in self._enabled_tools:
+                        skipped.append(t)
+                        previews[t] = {
+                            "enabled": True,
+                            "note": "Already enabled — schema is in the current context; use it directly.",
+                        }
+                    else:
+                        tdef = registry[t]
+                        previews[t] = {
+                            "enabled": False,
+                            "description": tdef["function"].get("description") or "",
+                            "schema": tdef["function"].get("parameters") or {},
+                        }
+                result: dict[str, Any] = {"success": True, "tools": previews}
+                if skipped:
+                    result["note"] = (
+                        f"{len(skipped)} already-enabled tool(s) skipped — schemas already in context."
+                    )
+                return result
+            if not (args.get("tool_name") or "").strip():
+                return {
+                    "success": False,
+                    "error": "Pass a non-empty 'tools' list (or a single 'tool_name').",
+                }
+            tool_name = (args.get("tool_name") or "").strip()
             if tool_name in registry:
                 if tool_name in self._enabled_tools:
                     return {
@@ -2480,28 +2751,47 @@ class LLMClient:
         args: dict[str, Any],
         state: _ToolExecutionState,
         on_tool_call: Callable[[str, dict, Any], None] | None,
+        cancel_event: threading.Event | None = None,
     ) -> dict[str, Any]:
-        """Dispatch one model tool call: meta tools locally, enabled tools via policy.
+        """Dispatch one model tool call: meta tools locally, real tools via policy.
 
-        Calls to real tools that were never enabled are rejected with a clear
-        instruction instead of executing with guessed arguments — crucial for
-        mutation tools.
+        Enable is not a call gate (PR #173 review): every catalog tool executes
+        through the framework policy path even when never enabled — enabling
+        only pins the schema into every request (cache/perf optimization).
+        Names outside the catalog and tools without an execution policy are
+        still refused, guarding against hallucinated names and unhandled
+        mutation semantics.
+
+        *cancel_event* (the panel's Stop signal) is forwarded to the policy
+        executor so long MCP calls can be interrupted and recorded (issue
+        #176).
         """
         if name in _META_TOOL_NAMES:
             result = self._execute_meta_tool(name, args)
             self._emit_tool_callback(on_tool_call, name, args, result)
             return result
-        if name not in self._enabled_tools:
+        registry = self._tool_registry or {}
+        if registry and name not in registry:
             result = {
                 "success": False,
                 "error": (
-                    f"Tool {name!r} is not enabled — call enable_tool(tools=[{name!r}]) "
-                    "first; its schema will be included in the next request."
+                    f"Unknown tool {name!r} — it is not in the catalog; use exact "
+                    "names from the catalog above."
                 ),
             }
             self._emit_tool_callback(on_tool_call, name, args, result)
             return result
-        return self._execute_tool_with_policy(name, args, state, on_tool_call)
+        if name not in TOOL_POLICIES:
+            result = {
+                "success": False,
+                "error": (
+                    f"Tool {name!r} has no execution policy (server/client mismatch) — "
+                    "refusing to execute it."
+                ),
+            }
+            self._emit_tool_callback(on_tool_call, name, args, result)
+            return result
+        return self._execute_tool_with_policy(name, args, state, on_tool_call, cancel_event)
 
     def _auto_reload_modified_files(
         self,
@@ -2514,7 +2804,9 @@ class LLMClient:
             return None
 
         reload_args = {"paths": sorted(state.dirty_paths)}
-        reload_result = call_mcp_tool(self._mcp_base_url, "reload_kicad", reload_args)
+        reload_result = call_mcp_tool(
+            self._mcp_base_url, "reload_kicad", reload_args, timeout=self._mcp_tool_timeout
+        )
         self._emit_tool_callback(on_tool_call, "reload_kicad", reload_args, reload_result)
 
         if self._tool_result_succeeded(reload_result):
@@ -2531,6 +2823,7 @@ class LLMClient:
         on_compacted: Callable[[str], None] | None = None,
         on_warning: Callable[[str], None] | None = None,
         images: list[dict[str, Any]] | None = None,
+        cancel_event: threading.Event | None = None,
     ) -> str:
         """
         Run one engineer request through the agentic loop.
@@ -2553,6 +2846,10 @@ class LLMClient:
                            exceeded with nothing to compact).
             images:        Optional list of dicts {"media_type": "image/png",
                            "data": "<base64>"} attached to this user message.
+            cancel_event:  Set by the UI Stop button.  Tool calls observe it
+                           while the MCP transport is blocked, so an in-flight
+                           long call is recorded as an interruption error entry
+                           instead of being silently dropped (issue #176).
 
         Returns:
             The final assistant text message for display.
@@ -2561,7 +2858,7 @@ class LLMClient:
         # through run() so it shares the turn lifecycle, but never send it
         # to the LLM — execute the call directly and record the tool pair.
         if isinstance(user_message, dict) and user_message.get("kind") == "tool_direct":
-            return self._run_tool_direct(user_message, on_tool_call)
+            return self._run_tool_direct(user_message, on_tool_call, cancel_event)
 
         system = (
             build_system_prompt(context_block)
@@ -2627,14 +2924,28 @@ class LLMClient:
                 self._history.append(msg_to_save)
                 tool_results = []
                 result_images: list[dict[str, str]] = []
-                for tc in tool_calls:
+                aborted_turn = False
+                for idx, tc in enumerate(tool_calls):
                     name = tc["function"]["name"]
                     try:
-                        args = json.loads(tc["function"].get("arguments", "{}"))
+                        args = json.loads(tc["function"].get("arguments") or "{}")
                     except json.JSONDecodeError:
                         args = {}
 
-                    result = self._execute_or_reject_tool(name, args, state, on_tool_call)
+                    if cancel_event is not None and cancel_event.is_set():
+                        # Stop was pressed: record the interruption instead of
+                        # executing the tool — the turn must not end with a
+                        # silently dropped call (issue #176).
+                        result = {
+                            "success": False,
+                            "error": f"tool call {name} interrupted by user",
+                            "interrupted": True,
+                        }
+                        self._emit_tool_callback(on_tool_call, name, args, result)
+                    else:
+                        result = self._execute_or_reject_tool(
+                            name, args, state, on_tool_call, cancel_event
+                        )
 
                     # Image-bearing tool results (e.g. export_pcb_layer_image)
                     # carry the PNG as a separate MCP image block.  Peel it off
@@ -2655,6 +2966,33 @@ class LLMClient:
                         }
                     )
 
+                    if isinstance(result, dict) and (
+                        result.get("interrupted") or result.get("timed_out")
+                    ):
+                        # A tool call that timed out or was interrupted ends the
+                        # turn with the recorded error.  The result entry stays
+                        # in history so the next turn sees why it failed; the
+                        # error is NOT fed back to the LLM, because retrying a
+                        # multi-minute call would just restart the clock.
+                        reply = (
+                            f"[Interrupted] {result['error']}"
+                            if result.get("interrupted")
+                            else f"[Error] {result['error']}"
+                        )
+                        # The rest of the batch is skipped (not executed):
+                        # every tool_call_id in the saved assistant message
+                        # must still get a recorded result, or the next turn's
+                        # provider request fails the tool_result pairing.
+                        self._skip_remaining_tool_calls(
+                            tool_calls,
+                            idx,
+                            on_tool_call,
+                            tool_results,
+                            interrupted=bool(result.get("interrupted")),
+                        )
+                        aborted_turn = True
+                        break
+
                 self._history.extend(tool_results)
                 if result_images and self._settings.llm_supports_vision:
                     self._history.append(
@@ -2671,6 +3009,8 @@ class LLMClient:
                             ],
                         }
                     )
+                if aborted_turn:
+                    break
             else:
                 reply = (
                     "[Error] Maximum tool-call iterations reached. Please try a simpler request."
